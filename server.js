@@ -125,10 +125,15 @@ app.post("/api/accounts", (req, res) => {
   }
 
   const accounts = read(accountsFile);
+  const normalizedIgUserId = String(igUserId).trim();
+  if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) {
+    return res.status(409).json({ error: "This Instagram account is already connected." });
+  }
+
   const item = {
     id: newId(),
     label,
-    igUserId: String(igUserId),
+    igUserId: normalizedIgUserId,
     tokenEnc: encrypt(accessToken),
     createdAt: new Date().toISOString()
   };
@@ -141,6 +146,19 @@ app.post("/api/accounts", (req, res) => {
     label: item.label,
     igUserId: item.igUserId
   });
+});
+
+app.delete("/api/accounts/:id", (req, res) => {
+  const accounts = read(accountsFile);
+  const account = accounts.find((a) => a.id === req.params.id);
+  if (!account) return res.status(404).json({ error: "Account not found." });
+
+  const jobs = read(jobsFile);
+  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "publishing"].includes(j.status));
+  if (active) return res.status(409).json({ error: "Cancel or finish this account's active jobs before removing it." });
+
+  write(accountsFile, accounts.filter((a) => a.id !== account.id));
+  res.json({ ok: true, removedId: account.id });
 });
 
 app.get("/api/jobs", (req, res) => {
