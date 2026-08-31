@@ -76,11 +76,11 @@ const upload = multer({
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v8</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v8 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v8.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v8.1 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, version: "8.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
+  res.json({ ok: true, version: "8.1.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
 });
 
 app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
@@ -91,7 +91,7 @@ app.post("/api/accounts", (req, res) => {
   const accounts = read(accountsFile);
   const normalizedIgUserId = String(igUserId).trim();
   if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) return res.status(409).json({ error: "This Instagram account is already connected." });
-  const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(accessToken), createdAt: new Date().toISOString() };
+  const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(String(accessToken).trim()), createdAt: new Date().toISOString() };
   accounts.push(item); write(accountsFile, accounts);
   res.json({ id: item.id, label: item.label, igUserId: item.igUserId });
 });
@@ -186,7 +186,7 @@ app.post("/api/schedule", upload.array("videos", 30), (req, res) => {
 });
 
 async function graph(pathname, params, token, method = "POST") {
-  const url = new URL(`https://graph.facebook.com/${GRAPH}/${pathname}`);
+  const url = new URL(`https://graph.instagram.com/${GRAPH}/${pathname}`);
   for (const [key, value] of Object.entries(params || {})) url.searchParams.set(key, String(value));
   url.searchParams.set("access_token", token);
   const response = await fetch(url, { method });
@@ -276,4 +276,4 @@ async function runScheduler() {
 setInterval(runScheduler, 5_000);
 runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v8 backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v8.1 backend running on port ${PORT}`));

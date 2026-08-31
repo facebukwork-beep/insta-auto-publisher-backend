@@ -1,3 +1,7 @@
+# v8.1 hotfix
+
+Uses `graph.instagram.com` for Instagram Login tokens (`instagram_business_*`) and trims pasted access tokens before encrypting/storing them.
+
 # Insta Auto Publisher v8 — Render Backend
 
 New in v8:
