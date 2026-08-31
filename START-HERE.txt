@@ -1,0 +1,19 @@
+RENDER QUICK SETUP
+
+[1] Extract ZIP
+      ↓
+[2] Upload all files to one GitHub repo
+      ↓
+[3] Render → New → Blueprint
+      ↓
+[4] Select GitHub repo
+      ↓
+[5] Deploy
+      ↓
+[6] Copy https://xxxxx.onrender.com
+      ↓
+[7] Paste that URL into Chrome extension → Backend URL
+      ↓
+[8] Connect Instagram Professional account + Meta token
+      ↓
+[9] Upload video → select IDs → choose random/fixed time → Schedule

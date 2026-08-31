@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: insta-auto-publisher
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_SECRET_KEY
+        generateValue: true
+      - key: GRAPH_API_VERSION
+        value: v23.0
