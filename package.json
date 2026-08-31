@@ -1,6 +1,6 @@
 {
   "name": "insta-auto-publisher-server",
-  "version": "6.0.0",
+  "version": "8.0.0",
   "private": true,
   "type": "module",
   "scripts": {

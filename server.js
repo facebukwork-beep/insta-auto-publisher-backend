@@ -11,15 +11,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 10000);
 const GRAPH = process.env.GRAPH_API_VERSION || "v23.0";
 const SECRET = process.env.APP_SECRET_KEY || "";
+const PREPARE_AHEAD_MS = Number(process.env.PREPARE_AHEAD_MINUTES || 10) * 60_000;
 
 if (!SECRET) {
   console.error("APP_SECRET_KEY is required.");
   process.exit(1);
 }
 
-// Accept any strong secret and derive a 32-byte AES key.
 const KEY = crypto.createHash("sha256").update(SECRET, "utf8").digest();
-
 const dataDir = path.join(__dirname, "data");
 const mediaDir = path.join(__dirname, "media");
 fs.mkdirSync(dataDir, { recursive: true });
@@ -32,6 +31,7 @@ if (!fs.existsSync(jobsFile)) fs.writeFileSync(jobsFile, "[]");
 
 const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
 const write = (f, x) => fs.writeFileSync(f, JSON.stringify(x, null, 2));
+const newId = () => crypto.randomUUID();
 
 function encrypt(text) {
   const iv = crypto.randomBytes(12);
@@ -44,30 +44,24 @@ function decrypt(payload) {
   const [ivHex, tagHex, dataHex] = payload.split(".");
   const decipher = crypto.createDecipheriv("aes-256-gcm", KEY, Buffer.from(ivHex, "hex"));
   decipher.setAuthTag(Buffer.from(tagHex, "hex"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(dataHex, "hex")),
-    decipher.final()
-  ]).toString("utf8");
-}
-
-const newId = () => crypto.randomUUID();
-
-function parseLocal(date, time) {
-  return new Date(`${date}T${time}:00`).getTime();
+  return Buffer.concat([decipher.update(Buffer.from(dataHex, "hex")), decipher.final()]).toString("utf8");
 }
 
 function generateTimes(count, start, end, gapMinutes) {
   const gap = Math.max(0, Number(gapMinutes || 0)) * 60_000;
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
-    throw new Error("Invalid random time window.");
-  }
-  if (count > 1 && end - start < (count - 1) * gap) {
-    throw new Error("Time window is too short for the requested minimum gap.");
-  }
-
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) throw new Error("Invalid random time window.");
+  if (count > 1 && end - start < (count - 1) * gap) throw new Error("Time window is too short for the requested minimum gap.");
   const spare = (end - start) - (count - 1) * gap;
   const randoms = Array.from({ length: count }, () => Math.random()).sort((a, b) => a - b);
   return randoms.map((r, i) => Math.floor(start + r * spare + i * gap)).sort((a, b) => a - b);
+}
+
+function publicBaseUrl(req) {
+  const explicit = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+  if (explicit) return explicit;
+  const renderUrl = (process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
+  if (renderUrl) return renderUrl;
+  return `${req.protocol}://${req.get("host")}`;
 }
 
 const app = express();
@@ -78,275 +72,208 @@ app.use("/media", express.static(mediaDir));
 
 const upload = multer({
   dest: mediaDir,
-  limits: { fileSize: 1024 * 1024 * 1024 }
+  limits: { fileSize: 1024 * 1024 * 1024, files: 30 }
 });
 
-function publicBaseUrl(req) {
-  const explicit = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
-  if (explicit) return explicit;
-
-  const renderUrl = (process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
-  if (renderUrl) return renderUrl;
-
-  return `${req.protocol}://${req.get("host")}`;
-}
-
 app.get("/", (req, res) => {
-  res.type("html").send(`
-    <html>
-      <head><title>Insta Auto Publisher</title></head>
-      <body style="font-family:Arial;background:#0b1018;color:white;padding:40px">
-        <h1>✅ Insta Auto Publisher Backend is Live</h1>
-        <p>Health endpoint: <code>/api/health</code></p>
-        <p>Graph API version: <b>${GRAPH}</b></p>
-      </body>
-    </html>
-  `);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v8</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v8 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    graphApiVersion: GRAPH,
-    publicBaseUrl: publicBaseUrl(req)
-  });
+  res.json({ ok: true, version: "8.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
 });
 
-app.get("/api/accounts", (req, res) => {
-  res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account));
-});
+app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
 
 app.post("/api/accounts", (req, res) => {
   const { label, igUserId, accessToken } = req.body || {};
-  if (!label || !igUserId || !accessToken) {
-    return res.status(400).json({
-      error: "label, igUserId and accessToken are required"
-    });
-  }
-
+  if (!label || !igUserId || !accessToken) return res.status(400).json({ error: "label, igUserId and accessToken are required" });
   const accounts = read(accountsFile);
   const normalizedIgUserId = String(igUserId).trim();
-  if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) {
-    return res.status(409).json({ error: "This Instagram account is already connected." });
-  }
-
-  const item = {
-    id: newId(),
-    label,
-    igUserId: normalizedIgUserId,
-    tokenEnc: encrypt(accessToken),
-    createdAt: new Date().toISOString()
-  };
-
-  accounts.push(item);
-  write(accountsFile, accounts);
-
-  res.json({
-    id: item.id,
-    label: item.label,
-    igUserId: item.igUserId
-  });
+  if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) return res.status(409).json({ error: "This Instagram account is already connected." });
+  const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(accessToken), createdAt: new Date().toISOString() };
+  accounts.push(item); write(accountsFile, accounts);
+  res.json({ id: item.id, label: item.label, igUserId: item.igUserId });
 });
 
 app.delete("/api/accounts/:id", (req, res) => {
   const accounts = read(accountsFile);
   const account = accounts.find((a) => a.id === req.params.id);
   if (!account) return res.status(404).json({ error: "Account not found." });
-
   const jobs = read(jobsFile);
-  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "publishing"].includes(j.status));
-  if (active) return res.status(409).json({ error: "Cancel or finish this account's active jobs before removing it." });
-
+  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "processing", "ready", "publishing"].includes(j.status));
+  if (active) return res.status(409).json({ error: "Finish this account's active jobs before removing it." });
   write(accountsFile, accounts.filter((a) => a.id !== account.id));
   res.json({ ok: true, removedId: account.id });
 });
 
-app.get("/api/jobs", (req, res) => {
-  res.json(read(jobsFile));
-});
+app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
 
-app.post("/api/schedule", upload.single("video"), (req, res) => {
+app.post("/api/schedule", upload.array("videos", 30), (req, res) => {
   try {
-    if (!req.file) throw new Error("Video is required.");
-
+    const files = req.files || [];
+    if (!files.length) throw new Error("At least one video is required.");
     const cfg = JSON.parse(req.body.config || "{}");
     const accounts = read(accountsFile);
-
-    const selected = (cfg.accountIds || [])
-      .map((accountId) => accounts.find((a) => a.id === accountId))
-      .filter(Boolean);
-
+    const selected = (cfg.accountIds || []).map((accountId) => accounts.find((a) => a.id === accountId)).filter(Boolean);
     if (!selected.length) throw new Error("No valid accounts selected.");
     if (selected.length > 15) throw new Error("Maximum 15 accounts per batch.");
+    if (files.length > 30) throw new Error("Maximum 30 videos per batch.");
 
+    const totalJobs = files.length * selected.length;
+    if (totalJobs > 300) throw new Error("Maximum 300 generated posts per batch.");
+
+    const now = Date.now();
     let scheduleTimes = [];
-
     if (cfg.mode === "random") {
-      let start = parseLocal(cfg.date, cfg.from);
-      const end = parseLocal(cfg.date, cfg.to);
-
-      start = Math.max(start, Date.now() + 60_000);
-      scheduleTimes = generateTimes(
-        selected.length,
-        start,
-        end,
-        Number(cfg.minGapMinutes || 0)
-      );
+      let start = new Date(cfg.startAt).getTime();
+      const end = new Date(cfg.endAt).getTime();
+      if (!Number.isFinite(start) || !Number.isFinite(end)) throw new Error("Invalid random time window.");
+      start = Math.max(start, now);
+      if (end <= now) throw new Error("Random window has already ended.");
+      scheduleTimes = generateTimes(totalJobs, start, end, Number(cfg.minGapMinutes || 0));
     } else {
-      const fixed = new Date(cfg.fixedAt).getTime();
-      if (!Number.isFinite(fixed) || fixed <= Date.now()) {
-        throw new Error("Fixed time must be in the future.");
-      }
-      scheduleTimes = selected.map(() => fixed);
+      let fixed = new Date(cfg.fixedAt).getTime();
+      if (!Number.isFinite(fixed)) throw new Error("Invalid fixed time.");
+      // datetime-local has minute precision. If the chosen current minute is already a few seconds old,
+      // treat it as NOW instead of shifting it into the future or rejecting it.
+      if (fixed < now - 90_000) throw new Error("Fixed time is too far in the past.");
+      if (fixed <= now + 5_000) fixed = now;
+      const gap = Math.max(0, Number(cfg.minGapMinutes || 0)) * 60_000;
+      scheduleTimes = Array.from({ length: totalJobs }, (_, i) => fixed + i * gap);
     }
-
-    const ext = path.extname(req.file.originalname) || ".mp4";
-    const finalName = `${req.file.filename}${ext}`;
-    const finalPath = path.join(mediaDir, finalName);
-    fs.renameSync(req.file.path, finalPath);
 
     const base = publicBaseUrl(req);
-    const mediaUrl = `${base}/media/${encodeURIComponent(finalName)}`;
+    const storedFiles = files.map((file) => {
+      const ext = path.extname(file.originalname) || ".mp4";
+      const finalName = `${file.filename}${ext}`;
+      fs.renameSync(file.path, path.join(mediaDir, finalName));
+      return { originalname: file.originalname, mediaUrl: `${base}/media/${encodeURIComponent(finalName)}` };
+    });
 
     const jobs = read(jobsFile);
-    selected.forEach((account, index) => {
-      jobs.push({
-        id: newId(),
-        accountId: account.id,
-        accountLabel: account.label,
-        igUserId: account.igUserId,
-        fileName: req.file.originalname,
-        mediaUrl,
-        caption: cfg.caption || "",
-        scheduledAt: new Date(scheduleTimes[index]).toISOString(),
-        status: "scheduled",
-        createdAt: new Date().toISOString(),
-        error: null,
-        publishedMediaId: null
-      });
-    });
+    const batchId = cfg.batchId || newId();
+    let index = 0;
+    // Every selected video is scheduled to every selected account.
+    for (const file of storedFiles) {
+      for (const account of selected) {
+        jobs.push({
+          id: newId(),
+          batchId,
+          accountId: account.id,
+          accountLabel: account.label,
+          igUserId: account.igUserId,
+          fileName: file.originalname,
+          mediaUrl: file.mediaUrl,
+          caption: cfg.caption || "",
+          scheduledAt: new Date(scheduleTimes[index++]).toISOString(),
+          status: "scheduled",
+          createdAt: new Date().toISOString(),
+          error: null,
+          containerId: null,
+          preparedAt: null,
+          publishedMediaId: null
+        });
+      }
+    }
 
     write(jobsFile, jobs);
-    res.json({
-      ok: true,
-      created: selected.length,
-      mediaUrl
-    });
+    res.json({ ok: true, created: totalJobs, videos: files.length, accounts: selected.length, firstScheduledAt: new Date(scheduleTimes[0]).toISOString(), lastScheduledAt: new Date(scheduleTimes[scheduleTimes.length - 1]).toISOString() });
   } catch (error) {
-    if (req.file?.path && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
+    for (const file of req.files || []) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
     res.status(400).json({ error: error.message });
   }
 });
 
 async function graph(pathname, params, token, method = "POST") {
   const url = new URL(`https://graph.facebook.com/${GRAPH}/${pathname}`);
-
-  for (const [key, value] of Object.entries(params || {})) {
-    url.searchParams.set(key, String(value));
-  }
+  for (const [key, value] of Object.entries(params || {})) url.searchParams.set(key, String(value));
   url.searchParams.set("access_token", token);
-
   const response = await fetch(url, { method });
   const json = await response.json();
-
-  if (!response.ok || json.error) {
-    throw new Error(json.error?.message || `Meta API HTTP ${response.status}`);
-  }
+  if (!response.ok || json.error) throw new Error(json.error?.message || `Meta API HTTP ${response.status}`);
   return json;
 }
 
-async function publish(job, account) {
+async function createContainer(job, account) {
   const token = decrypt(account.tokenEnc);
+  const created = await graph(`${account.igUserId}/media`, { media_type: "REELS", video_url: job.mediaUrl, caption: job.caption, share_to_feed: "true" }, token);
+  return created.id;
+}
 
-  const containerResponse = await graph(
-    `${account.igUserId}/media`,
-    {
-      media_type: "REELS",
-      video_url: job.mediaUrl,
-      caption: job.caption,
-      share_to_feed: "true"
-    },
-    token
-  );
+async function checkContainer(job, account) {
+  const token = decrypt(account.tokenEnc);
+  return graph(job.containerId, { fields: "status_code,status" }, token, "GET");
+}
 
-  const creationId = containerResponse.id;
-  const deadline = Date.now() + 12 * 60_000;
-
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 15_000));
-
-    const status = await graph(
-      creationId,
-      { fields: "status_code,status" },
-      token,
-      "GET"
-    );
-
-    if (status.status_code === "FINISHED") {
-      const published = await graph(
-        `${account.igUserId}/media_publish`,
-        { creation_id: creationId },
-        token
-      );
-      return published.id;
-    }
-
-    if (status.status_code === "ERROR" || status.status_code === "EXPIRED") {
-      throw new Error(`Instagram container status: ${status.status_code}`);
-    }
-  }
-
-  throw new Error("Timed out waiting for Instagram video processing.");
+async function publishContainer(job, account) {
+  const token = decrypt(account.tokenEnc);
+  const published = await graph(`${account.igUserId}/media_publish`, { creation_id: job.containerId }, token);
+  return published.id;
 }
 
 let busy = false;
-
-async function runDueJobs() {
+async function runScheduler() {
   if (busy) return;
   busy = true;
-
   try {
     const accounts = read(accountsFile);
     const jobs = read(jobsFile);
+    let changed = false;
+    const now = Date.now();
 
     for (const job of jobs) {
-      if (job.status !== "scheduled") continue;
-      if (new Date(job.scheduledAt).getTime() > Date.now()) continue;
-
+      if (["published", "failed"].includes(job.status)) continue;
       const account = accounts.find((a) => a.id === job.accountId);
-
-      if (!account) {
-        job.status = "failed";
-        job.error = "Connected account not found.";
-        write(jobsFile, jobs);
-        continue;
-      }
-
-      job.status = "publishing";
-      job.error = null;
-      write(jobsFile, jobs);
+      if (!account) { job.status = "failed"; job.error = "Connected account not found."; changed = true; continue; }
+      const dueAt = new Date(job.scheduledAt).getTime();
 
       try {
-        job.publishedMediaId = await publish(job, account);
-        job.status = "published";
-        job.publishedAt = new Date().toISOString();
+        // Prepare video container before the target time so media processing does not push the post late.
+        if (job.status === "scheduled" && dueAt - now <= PREPARE_AHEAD_MS) {
+          job.containerId = await createContainer(job, account);
+          job.status = "processing";
+          job.preparedAt = new Date().toISOString();
+          job.error = null;
+          changed = true;
+          write(jobsFile, jobs);
+        }
+
+        if (job.status === "processing" && job.containerId) {
+          const state = await checkContainer(job, account);
+          if (state.status_code === "FINISHED") {
+            job.status = "ready";
+            job.readyAt = new Date().toISOString();
+            changed = true;
+          } else if (state.status_code === "ERROR" || state.status_code === "EXPIRED") {
+            throw new Error(`Instagram container status: ${state.status_code}`);
+          }
+        }
+
+        if (job.status === "ready" && dueAt <= Date.now()) {
+          job.status = "publishing";
+          changed = true;
+          write(jobsFile, jobs);
+          job.publishedMediaId = await publishContainer(job, account);
+          job.status = "published";
+          job.publishedAt = new Date().toISOString();
+          job.error = null;
+          changed = true;
+        }
       } catch (error) {
         job.status = "failed";
         job.error = error.message;
+        changed = true;
       }
-
-      write(jobsFile, jobs);
     }
+
+    if (changed) write(jobsFile, jobs);
   } finally {
     busy = false;
   }
 }
 
-setInterval(runDueJobs, 30_000);
-runDueJobs();
+setInterval(runScheduler, 5_000);
+runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Insta Auto Publisher backend running on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v8 backend running on port ${PORT}`));

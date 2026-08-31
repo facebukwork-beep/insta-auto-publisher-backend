@@ -1,19 +1,7 @@
-RENDER QUICK SETUP
-
-[1] Extract ZIP
-      ↓
-[2] Upload all files to one GitHub repo
-      ↓
-[3] Render → New → Blueprint
-      ↓
-[4] Select GitHub repo
-      ↓
-[5] Deploy
-      ↓
-[6] Copy https://xxxxx.onrender.com
-      ↓
-[7] Paste that URL into Chrome extension → Backend URL
-      ↓
-[8] Connect Instagram Professional account + Meta token
-      ↓
-[9] Upload video → select IDs → choose random/fixed time → Schedule
+V8 BACKEND UPDATE
+1) Extract this ZIP.
+2) Upload the extracted files to the ROOT of your existing GitHub backend repo.
+3) Commit changes.
+4) Render -> Manual Deploy -> Deploy latest commit (if auto deploy does not start).
+5) Wait for Live.
+6) Open /api/health and confirm version is 8.0.0.

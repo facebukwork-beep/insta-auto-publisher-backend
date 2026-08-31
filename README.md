@@ -1,61 +1,23 @@
-# Insta Auto Publisher — Render Ready
+# Insta Auto Publisher v8 — Render Backend
 
-This folder is ready to upload to GitHub and deploy on Render.
+New in v8:
+- Exact local-time fix: browser converts the chosen local time to ISO/UTC before sending it to Render, removing server-timezone drift.
+- Future posts are pre-processed up to 10 minutes early, then `media_publish` is called at the scheduled time.
+- Selecting the current minute starts publishing immediately instead of moving the job to a later time.
+- Multiple videos + multiple accounts: every selected video is scheduled to every selected account (max 30 videos, 15 accounts, 300 generated jobs per batch).
+- Duplicate-account protection and account removal remain enabled.
 
-## Easiest setup
+## Render
+Build: `npm install`
+Start: `npm start`
 
-### 1. Upload this folder to GitHub
-Create a new GitHub repository and upload all files from this folder.
+Required env vars:
+- `APP_SECRET_KEY` — any strong secret (Render can generate one)
+- `GRAPH_API_VERSION` — e.g. `v23.0`
 
-Important: upload `render.yaml`, `server.js`, and `package.json` at the repository root.
+Optional:
+- `PREPARE_AHEAD_MINUTES=10`
+- `PUBLIC_BASE_URL` (normally not needed on Render; `RENDER_EXTERNAL_URL` is detected automatically)
 
-### 2. Deploy on Render
-1. Open Render.
-2. Choose New → Blueprint.
-3. Connect the GitHub repository.
-4. Render will detect `render.yaml`.
-5. Create/deploy the service.
-
-The Blueprint automatically configures:
-- Node runtime
-- `npm install`
-- `npm start`
-- `/api/health` health check
-- a generated `APP_SECRET_KEY`
-
-### 3. After deploy
-Open:
-
-`https://YOUR-SERVICE.onrender.com/api/health`
-
-You should see JSON with `"ok": true`.
-
-### 4. Put Render URL in the Chrome extension
-Example:
-
-`https://insta-auto-publisher-xxxx.onrender.com`
-
-Do not add `/api/health` to the extension URL.
-
-### 5. Connect Instagram accounts
-Inside the extension add:
-- Account label / username
-- Instagram User ID
-- Valid Meta access token
-
-For real publishing, the Instagram account and Meta app must be eligible for Instagram's official publishing API and have the required permissions.
-
-## Random scheduler
-Choose:
-- Posting date
-- From time
-- To time
-- Up to 15 accounts
-
-The backend creates separate random posting times and publishes jobs when they become due.
-
-## Important Render storage note
-The example stores uploaded videos, account data, and jobs on the server filesystem. On hosts with ephemeral filesystems, files can disappear after redeploy/restart. For serious long-term use, move media and job/account storage to persistent storage/database/object storage.
-
-## Graph API version
-`render.yaml` currently provides a starter `GRAPH_API_VERSION`. Check your Meta developer dashboard and change it to a currently supported version when needed.
+## Important reliability note
+A free Render web service can sleep when inactive. Exact unattended posting cannot be guaranteed while the service is asleep. An always-on instance is recommended for timing-sensitive production use. Render's local filesystem is also ephemeral, so production use should move accounts/jobs/media to persistent storage.
