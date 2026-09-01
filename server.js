@@ -12,6 +12,9 @@ const PORT = Number(process.env.PORT || 10000);
 const GRAPH = process.env.GRAPH_API_VERSION || "v23.0";
 const SECRET = process.env.APP_SECRET_KEY || "";
 const PREPARE_AHEAD_MS = Number(process.env.PREPARE_AHEAD_MINUTES || 10) * 60_000;
+const META_MIN_REQUEST_INTERVAL_MS = Math.max(5, Number(process.env.META_MIN_REQUEST_INTERVAL_SECONDS || 10)) * 1000;
+const RATE_LIMIT_BACKOFF_MS = Math.max(5, Number(process.env.META_RATE_LIMIT_BACKOFF_MINUTES || 30)) * 60_000;
+const MAX_AUTO_RETRIES = Math.max(1, Number(process.env.MAX_AUTO_RETRIES || 8));
 
 if (!SECRET) {
   console.error("APP_SECRET_KEY is required.");
@@ -76,11 +79,11 @@ const upload = multer({
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v9</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v9 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v10</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v10 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, version: "9.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
+  res.json({ ok: true, version: "10.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
@@ -126,7 +129,7 @@ app.delete("/api/accounts/:id", (req, res) => {
   const account = accounts.find((a) => a.id === req.params.id);
   if (!account) return res.status(404).json({ error: "Account not found." });
   const jobs = read(jobsFile);
-  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "processing", "ready", "publishing"].includes(j.status));
+  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "processing", "ready", "publishing", "retry_wait"].includes(j.status));
   if (active) return res.status(409).json({ error: "Finish this account's active jobs before removing it." });
   write(accountsFile, accounts.filter((a) => a.id !== account.id));
   res.json({ ok: true, removedId: account.id });
@@ -200,7 +203,11 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
           error: null,
           containerId: null,
           preparedAt: null,
-          publishedMediaId: null
+          publishedMediaId: null,
+          retryCount: 0,
+          nextAttemptAt: null,
+          lastAttemptAt: null,
+          lastErrorType: null
         });
       }
     }
@@ -211,6 +218,45 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
     for (const file of req.files || []) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
     res.status(400).json({ error: error.message });
   }
+});
+
+function isRateLimitError(message) {
+  return /request limit|rate limit|too many|temporarily blocked|try again later|throttl/i.test(String(message || ""));
+}
+
+function retryDelayMs(retryCount, rateLimited = false) {
+  if (rateLimited) return Math.min(6 * 60 * 60_000, RATE_LIMIT_BACKOFF_MS * Math.max(1, Math.pow(2, Math.min(retryCount - 1, 3))));
+  return Math.min(60 * 60_000, 2 * 60_000 * Math.max(1, Math.pow(2, Math.min(retryCount - 1, 5))));
+}
+
+app.post("/api/jobs/:id/retry", (req, res) => {
+  const jobs = read(jobsFile);
+  const job = jobs.find(j => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found." });
+  if (job.status !== "failed") return res.status(409).json({ error: "Only failed jobs can be retried manually." });
+  job.status = job.containerId ? "processing" : "scheduled";
+  job.error = null;
+  job.lastErrorType = null;
+  job.nextAttemptAt = new Date(Date.now() + 15_000).toISOString();
+  job.retryCount = 0;
+  write(jobsFile, jobs);
+  res.json({ ok: true, id: job.id, status: job.status });
+});
+
+app.post("/api/jobs/retry-failed", (req, res) => {
+  const jobs = read(jobsFile);
+  let count = 0;
+  for (const job of jobs) {
+    if (job.status !== "failed") continue;
+    job.status = job.containerId ? "processing" : "scheduled";
+    job.error = null;
+    job.lastErrorType = null;
+    job.nextAttemptAt = new Date(Date.now() + 15_000 + count * 1000).toISOString();
+    job.retryCount = 0;
+    count++;
+  }
+  if (count) write(jobsFile, jobs);
+  res.json({ ok: true, retried: count });
 });
 
 async function graph(pathname, params, token, method = "POST") {
@@ -241,58 +287,111 @@ async function publishContainer(job, account) {
 }
 
 let busy = false;
+let lastMetaRequestAt = 0;
+let globalBackoffUntil = 0;
+
+function eligibleAt(job, now) {
+  if (job.nextAttemptAt && new Date(job.nextAttemptAt).getTime() > now) return false;
+  return true;
+}
+
+function markRetry(job, error, rateLimited) {
+  job.retryCount = Number(job.retryCount || 0) + 1;
+  job.error = error.message;
+  job.lastErrorType = rateLimited ? "rate_limit" : "transient";
+  if (job.retryCount > MAX_AUTO_RETRIES) {
+    job.status = "failed";
+    job.nextAttemptAt = null;
+    return;
+  }
+  const delay = retryDelayMs(job.retryCount, rateLimited);
+  job.status = "retry_wait";
+  job.nextAttemptAt = new Date(Date.now() + delay).toISOString();
+  if (rateLimited) globalBackoffUntil = Math.max(globalBackoffUntil, Date.now() + delay);
+}
+
 async function runScheduler() {
   if (busy) return;
+  const now = Date.now();
+  if (now < globalBackoffUntil) return;
+  if (now - lastMetaRequestAt < META_MIN_REQUEST_INTERVAL_MS) return;
   busy = true;
   try {
     const accounts = read(accountsFile);
     const jobs = read(jobsFile);
     let changed = false;
-    const now = Date.now();
 
+    // Wake retry jobs only when their backoff has elapsed.
     for (const job of jobs) {
-      if (["published", "failed"].includes(job.status)) continue;
-      const account = accounts.find((a) => a.id === job.accountId);
-      if (!account) { job.status = "failed"; job.error = "Connected account not found."; changed = true; continue; }
+      if (job.status === "retry_wait" && eligibleAt(job, now)) {
+        job.status = job.containerId ? "processing" : "scheduled";
+        job.nextAttemptAt = null;
+        changed = true;
+      }
+    }
+
+    // Do at most ONE Meta API action per scheduler pass. This deliberately
+    // trades speed for compliance and prevents bursts when hundreds of jobs exist.
+    const ordered = jobs
+      .filter(j => !["published", "failed", "retry_wait"].includes(j.status) && eligibleAt(j, now))
+      .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+
+    for (const job of ordered) {
+      const account = accounts.find(a => a.id === job.accountId);
+      if (!account) {
+        job.status = "failed";
+        job.error = "Connected account not found.";
+        changed = true;
+        continue;
+      }
       const dueAt = new Date(job.scheduledAt).getTime();
+      let action = null;
+      if (job.status === "scheduled" && dueAt - now <= PREPARE_AHEAD_MS) action = "create";
+      else if (job.status === "processing" && job.containerId) action = "check";
+      else if (job.status === "ready" && dueAt <= now) action = "publish";
+      if (!action) continue;
 
       try {
-        // Prepare video container before the target time so media processing does not push the post late.
-        if (job.status === "scheduled" && dueAt - now <= PREPARE_AHEAD_MS) {
+        job.lastAttemptAt = new Date().toISOString();
+        lastMetaRequestAt = Date.now();
+        if (action === "create") {
           job.containerId = await createContainer(job, account);
           job.status = "processing";
           job.preparedAt = new Date().toISOString();
           job.error = null;
-          changed = true;
-          write(jobsFile, jobs);
-        }
-
-        if (job.status === "processing" && job.containerId) {
+          job.lastErrorType = null;
+        } else if (action === "check") {
           const state = await checkContainer(job, account);
           if (state.status_code === "FINISHED") {
             job.status = "ready";
             job.readyAt = new Date().toISOString();
-            changed = true;
+            job.error = null;
+            job.lastErrorType = null;
           } else if (state.status_code === "ERROR" || state.status_code === "EXPIRED") {
+            // A broken/expired container can be recreated on a later attempt.
+            job.containerId = null;
             throw new Error(`Instagram container status: ${state.status_code}`);
+          } else {
+            // Poll slowly; do not hammer container status endpoints.
+            job.nextAttemptAt = new Date(Date.now() + 30_000).toISOString();
           }
-        }
-
-        if (job.status === "ready" && dueAt <= Date.now()) {
+        } else if (action === "publish") {
           job.status = "publishing";
-          changed = true;
           write(jobsFile, jobs);
           job.publishedMediaId = await publishContainer(job, account);
           job.status = "published";
           job.publishedAt = new Date().toISOString();
           job.error = null;
-          changed = true;
+          job.lastErrorType = null;
+          job.nextAttemptAt = null;
         }
+        changed = true;
       } catch (error) {
-        job.status = "failed";
-        job.error = error.message;
+        const rateLimited = isRateLimitError(error.message);
+        markRetry(job, error, rateLimited);
         changed = true;
       }
+      break;
     }
 
     if (changed) write(jobsFile, jobs);
@@ -304,4 +403,4 @@ async function runScheduler() {
 setInterval(runScheduler, 5_000);
 runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v9 backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v10 backend running on port ${PORT}`));

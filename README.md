@@ -1,3 +1,7 @@
+# v10 Smart Rate-Limit Queue
+
+This version performs at most one Meta API action at a time, spaces API requests, automatically backs off on rate-limit responses, retries transient failures, and exposes manual retry endpoints. It does not bypass Meta limits; it slows down to respect them.
+
 # v9 hotfix
 
 Uses `graph.instagram.com` for Instagram Login tokens (`instagram_business_*`) and trims pasted access tokens before encrypting/storing them.
