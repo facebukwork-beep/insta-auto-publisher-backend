@@ -1,0 +1,1 @@
+v10.4 keeps the encrypted /api/accounts/restore endpoint used by the extension stable-ID recovery flow. No new secrets are exposed.
