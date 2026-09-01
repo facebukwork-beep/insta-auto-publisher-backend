@@ -72,18 +72,43 @@ app.use("/media", express.static(mediaDir));
 
 const upload = multer({
   dest: mediaDir,
-  limits: { fileSize: 1024 * 1024 * 1024, files: 30 }
+  limits: { fileSize: 1024 * 1024 * 1024, files: 10 }
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v8.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v8.1 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v9</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v9 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, version: "8.1.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
+  res.json({ ok: true, version: "9.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000 });
 });
 
 app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
+
+function makeBackupBlob(item) {
+  return encrypt(JSON.stringify({ v: 1, label: item.label, igUserId: item.igUserId, tokenEnc: item.tokenEnc }));
+}
+
+app.post("/api/accounts/restore", (req, res) => {
+  const blobs = Array.isArray(req.body?.backups) ? req.body.backups : [];
+  if (!blobs.length) return res.json({ ok: true, restored: 0 });
+  const accounts = read(accountsFile);
+  let restored = 0;
+  for (const blob of blobs.slice(0, 30)) {
+    try {
+      const data = JSON.parse(decrypt(String(blob)));
+      if (!data?.igUserId || !data?.label || !data?.tokenEnc) continue;
+      const ig = String(data.igUserId).trim();
+      if (accounts.some(a => String(a.igUserId).trim() === ig)) continue;
+      // Verify nested encrypted token is still decryptable with the current APP_SECRET_KEY.
+      decrypt(data.tokenEnc);
+      accounts.push({ id: newId(), label: String(data.label).replace(/^@/, "").trim(), igUserId: ig, tokenEnc: data.tokenEnc, createdAt: new Date().toISOString(), restoredAt: new Date().toISOString() });
+      restored++;
+    } catch (_) {}
+  }
+  if (restored) write(accountsFile, accounts);
+  res.json({ ok: true, restored });
+});
 
 app.post("/api/accounts", (req, res) => {
   const { label, igUserId, accessToken } = req.body || {};
@@ -93,7 +118,7 @@ app.post("/api/accounts", (req, res) => {
   if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) return res.status(409).json({ error: "This Instagram account is already connected." });
   const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(String(accessToken).trim()), createdAt: new Date().toISOString() };
   accounts.push(item); write(accountsFile, accounts);
-  res.json({ id: item.id, label: item.label, igUserId: item.igUserId });
+  res.json({ id: item.id, label: item.label, igUserId: item.igUserId, backupBlob: makeBackupBlob(item) });
 });
 
 app.delete("/api/accounts/:id", (req, res) => {
@@ -109,7 +134,7 @@ app.delete("/api/accounts/:id", (req, res) => {
 
 app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
 
-app.post("/api/schedule", upload.array("videos", 30), (req, res) => {
+app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
   try {
     const files = req.files || [];
     if (!files.length) throw new Error("At least one video is required.");
@@ -118,14 +143,17 @@ app.post("/api/schedule", upload.array("videos", 30), (req, res) => {
     const selected = (cfg.accountIds || []).map((accountId) => accounts.find((a) => a.id === accountId)).filter(Boolean);
     if (!selected.length) throw new Error("No valid accounts selected.");
     if (selected.length > 15) throw new Error("Maximum 15 accounts per batch.");
-    if (files.length > 30) throw new Error("Maximum 30 videos per batch.");
+    if (files.length > 10) throw new Error("Maximum 10 videos per upload chunk.");
 
     const totalJobs = files.length * selected.length;
-    if (totalJobs > 300) throw new Error("Maximum 300 generated posts per batch.");
+    if (totalJobs > 150) throw new Error("Maximum 150 generated posts per upload chunk.");
 
     const now = Date.now();
     let scheduleTimes = [];
-    if (cfg.mode === "random") {
+    if (cfg.mode === "explicit") {
+      if (!Array.isArray(cfg.explicitTimes) || cfg.explicitTimes.length !== totalJobs) throw new Error("Explicit schedule count does not match generated jobs.");
+      scheduleTimes = cfg.explicitTimes.map((v) => { const t = new Date(v).getTime(); if (!Number.isFinite(t)) throw new Error("Invalid explicit schedule time."); return t; });
+    } else if (cfg.mode === "random") {
       let start = new Date(cfg.startAt).getTime();
       const end = new Date(cfg.endAt).getTime();
       if (!Number.isFinite(start) || !Number.isFinite(end)) throw new Error("Invalid random time window.");
@@ -276,4 +304,4 @@ async function runScheduler() {
 setInterval(runScheduler, 5_000);
 runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v8.1 backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v9 backend running on port ${PORT}`));

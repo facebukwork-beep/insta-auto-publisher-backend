@@ -1,10 +1,10 @@
-# v8.1 hotfix
+# v9 hotfix
 
 Uses `graph.instagram.com` for Instagram Login tokens (`instagram_business_*`) and trims pasted access tokens before encrypting/storing them.
 
-# Insta Auto Publisher v8 — Render Backend
+# Insta Auto Publisher v9 — Render Backend
 
-New in v8:
+New in v9:
 - Exact local-time fix: browser converts the chosen local time to ISO/UTC before sending it to Render, removing server-timezone drift.
 - Future posts are pre-processed up to 10 minutes early, then `media_publish` is called at the scheduled time.
 - Selecting the current minute starts publishing immediately instead of moving the job to a later time.
