@@ -256,6 +256,8 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
           containerId: null,
           preparedAt: null,
           publishedMediaId: null,
+          permalink: null,
+          permalinkFetchedAt: null,
           retryCount: 0,
           nextAttemptAt: null,
           lastAttemptAt: null,
@@ -338,6 +340,13 @@ async function publishContainer(job, account) {
   return published.id;
 }
 
+async function fetchPublishedPermalink(job, account) {
+  if (!job.publishedMediaId) return null;
+  const token = decrypt(account.tokenEnc);
+  const media = await graph(job.publishedMediaId, { fields: "permalink" }, token, "GET");
+  return media.permalink || null;
+}
+
 let busy = false;
 let lastMetaRequestAt = 0;
 let globalBackoffUntil = 0;
@@ -385,7 +394,7 @@ async function runScheduler() {
     // Do at most ONE Meta API action per scheduler pass. This deliberately
     // trades speed for compliance and prevents bursts when hundreds of jobs exist.
     const ordered = jobs
-      .filter(j => !["published", "failed", "retry_wait"].includes(j.status) && eligibleAt(j, now))
+      .filter(j => !["failed", "retry_wait"].includes(j.status) && eligibleAt(j, now) && (j.status !== "published" || (j.publishedMediaId && !j.permalink)))
       .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
 
     for (const job of ordered) {
@@ -401,6 +410,7 @@ async function runScheduler() {
       if (job.status === "scheduled" && dueAt - now <= PREPARE_AHEAD_MS) action = "create";
       else if (job.status === "processing" && job.containerId) action = "check";
       else if (job.status === "ready" && dueAt <= now) action = "publish";
+      else if (job.status === "published" && job.publishedMediaId && !job.permalink) action = "permalink";
       if (!action) continue;
 
       try {
@@ -435,6 +445,10 @@ async function runScheduler() {
           job.publishedAt = new Date().toISOString();
           job.error = null;
           job.lastErrorType = null;
+          job.nextAttemptAt = null;
+        } else if (action === "permalink") {
+          job.permalink = await fetchPublishedPermalink(job, account);
+          job.permalinkFetchedAt = new Date().toISOString();
           job.nextAttemptAt = null;
         }
         changed = true;

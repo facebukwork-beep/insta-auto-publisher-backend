@@ -1,0 +1,4 @@
+v10.6 backend
+- Stores permalink for successfully published media.
+- Fetches permalink in a separate throttled Meta API scheduler action after publish.
+- Existing smart rate-limit behavior preserved.
