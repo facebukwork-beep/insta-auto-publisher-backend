@@ -137,6 +137,58 @@ app.delete("/api/accounts/:id", (req, res) => {
 
 app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
 
+// Manually remove a queued job. We intentionally block jobs that are actively
+// processing/publishing or already published so a user cannot interrupt a Meta
+// API transaction halfway through.
+app.delete("/api/jobs/:id", (req, res) => {
+  const jobs = read(jobsFile);
+  const index = jobs.findIndex((j) => j.id === req.params.id);
+  if (index < 0) return res.status(404).json({ error: "Job not found." });
+  const job = jobs[index];
+  if (["processing", "publishing", "published"].includes(job.status)) {
+    return res.status(409).json({ error: `Cannot delete a ${job.status} job.` });
+  }
+  const [removed] = jobs.splice(index, 1);
+  write(jobsFile, jobs);
+
+  // Delete the local media file only if no other queued/history job references it.
+  if (removed.mediaUrl && !jobs.some((j) => j.mediaUrl === removed.mediaUrl)) {
+    try {
+      const pathname = new URL(removed.mediaUrl).pathname;
+      const name = decodeURIComponent(path.basename(pathname));
+      const filePath = path.join(mediaDir, name);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (_) {}
+  }
+  res.json({ ok: true, deleted: removed.id });
+});
+
+// Ignore the original schedule for one job and move it to the front of the
+// normal smart-rate-limit queue. It still respects Meta throttling/backoff.
+app.post("/api/jobs/:id/post-now", (req, res) => {
+  const jobs = read(jobsFile);
+  const job = jobs.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found." });
+  if (["processing", "publishing", "published"].includes(job.status)) {
+    return res.status(409).json({ error: `Cannot Post Now while job is ${job.status}.` });
+  }
+  job.scheduledAt = new Date().toISOString();
+  job.nextAttemptAt = null;
+  job.error = null;
+  job.lastErrorType = null;
+  // If a container already exists and was ready, publish on the next scheduler
+  // pass; otherwise resume preparation/checking without creating duplicates.
+  if (job.status === "ready") {
+    job.status = "ready";
+  } else if (job.containerId) {
+    job.status = "processing";
+  } else {
+    job.status = "scheduled";
+  }
+  write(jobsFile, jobs);
+  res.json({ ok: true, id: job.id, status: job.status, scheduledAt: job.scheduledAt });
+});
+
 app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
   try {
     const files = req.files || [];
@@ -403,4 +455,4 @@ async function runScheduler() {
 setInterval(runScheduler, 5_000);
 runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v10 backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v10.3 backend running on port ${PORT}`));

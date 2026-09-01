@@ -1,0 +1,11 @@
+Insta Auto Publisher v10.3
+
+NEW
+- Post Now button on scheduled / ready / retry-wait / failed queue items.
+- Delete button on queued items.
+- Post Now ignores the original schedule but still uses the smart Meta rate-limit queue.
+- Active processing/publishing and already-published jobs cannot be deleted or forced again.
+- If a deleted job is the last job using a local media file, the backend removes that file too.
+
+IMPORTANT
+- Backend v10.3 must be deployed for Post Now/Delete to work.
