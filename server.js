@@ -237,8 +237,11 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
     const jobs = read(jobsFile);
     const batchId = cfg.batchId || newId();
     let index = 0;
+    const perVideoCaptions = Array.isArray(cfg.captions) ? cfg.captions.map((v) => String(v ?? "").slice(0, 2200)) : [];
+    let fileIndex = 0;
     // Every selected video is scheduled to every selected account.
     for (const file of storedFiles) {
+      const fileCaption = (perVideoCaptions[fileIndex] !== undefined ? perVideoCaptions[fileIndex] : String(cfg.caption || "")).slice(0, 2200);
       for (const account of selected) {
         jobs.push({
           id: newId(),
@@ -248,7 +251,7 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
           igUserId: account.igUserId,
           fileName: file.originalname,
           mediaUrl: file.mediaUrl,
-          caption: cfg.caption || "",
+          caption: fileCaption,
           scheduledAt: new Date(scheduleTimes[index++]).toISOString(),
           status: "scheduled",
           createdAt: new Date().toISOString(),
@@ -264,6 +267,7 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
           lastErrorType: null
         });
       }
+      fileIndex++;
     }
 
     write(jobsFile, jobs);
