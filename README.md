@@ -29,3 +29,7 @@ Optional:
 
 ## Important reliability note
 A free Render web service can sleep when inactive. Exact unattended posting cannot be guaranteed while the service is asleep. An always-on instance is recommended for timing-sensitive production use. Render's local filesystem is also ephemeral, so production use should move accounts/jobs/media to persistent storage.
+
+
+## v11.2 account recovery
+Keep APP_SECRET_KEY unchanged on Render. The extension mirrors encrypted per-account recovery blobs to Chrome sync/local storage and automatically restores them when the backend URL is saved or the extension starts. The backend endpoint /api/accounts/recovery-pack never returns a plaintext access token.

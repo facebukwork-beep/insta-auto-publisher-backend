@@ -79,18 +79,34 @@ const upload = multer({
 });
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v10</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v10.4 Backend is Live</h1><p>Exact-time pre-processing + multi-video/multi-account scheduling enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v11.2</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v11.2 Backend is Live</h1><p>Auto-caption, burst scheduling, published links, and permanent account recovery vault enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, version: "10.4.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "11.2.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
 
 function makeBackupBlob(item) {
-  return encrypt(JSON.stringify({ v: 1, label: item.label, igUserId: item.igUserId, tokenEnc: item.tokenEnc }));
+  return encrypt(JSON.stringify({ v: 2, label: item.label, igUserId: item.igUserId, tokenEnc: item.tokenEnc }));
 }
+
+// v11.2 recovery pack: lets the extension continuously mirror encrypted
+// account recovery blobs into chrome.storage.sync. No plaintext access token is
+// returned. This endpoint is especially useful before a Render redeploy/reset.
+app.get("/api/accounts/recovery-pack", (req, res) => {
+  const accounts = read(accountsFile);
+  res.json({
+    ok: true,
+    count: accounts.length,
+    backups: accounts.map((item) => ({
+      igUserId: String(item.igUserId),
+      label: item.label,
+      backupBlob: makeBackupBlob(item)
+    }))
+  });
+});
 
 app.post("/api/accounts/restore", (req, res) => {
   const blobs = Array.isArray(req.body?.backups) ? req.body.backups : [];
@@ -473,4 +489,4 @@ async function runScheduler() {
 setInterval(runScheduler, 5_000);
 runScheduler();
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v10.3 backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v11.2 backend running on port ${PORT}`));

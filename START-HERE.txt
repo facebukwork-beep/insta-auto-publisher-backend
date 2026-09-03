@@ -5,3 +5,7 @@ V8 BACKEND UPDATE
 4) Render -> Manual Deploy -> Deploy latest commit (if auto deploy does not start).
 5) Wait for Live.
 6) Open /api/health and confirm version is 8.0.0.
+
+
+## v11.2 account recovery
+Keep APP_SECRET_KEY unchanged on Render. The extension mirrors encrypted per-account recovery blobs to Chrome sync/local storage and automatically restores them when the backend URL is saved or the extension starts. The backend endpoint /api/accounts/recovery-pack never returns a plaintext access token.
