@@ -1,37 +1,47 @@
-# Insta Auto Publisher v14.1 — Neon + Google Drive Durable Backend
+# Insta Auto Publisher v14.3 — One-Click Google Drive OAuth
 
-This version supports a no-R2-payment path:
+This release fixes repeated Google Drive OAuth refresh-token/client-secret mismatch errors by moving Drive authorization into the backend itself.
 
-- **Neon PostgreSQL**: accounts, scheduled jobs, published history, scheduler state
-- **Google Drive**: video files
-- **Render**: API + scheduler + secure media proxy to Meta/Instagram
+## What changes
 
-When `DATABASE_URL` and the four `GDRIVE_*` variables are configured, `/api/storage-status` should report:
+- `/api/google-drive/connect-info` shows the exact OAuth callback URI for this backend.
+- `/api/google-drive/connect` starts Google authorization using the same `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` that the backend will later use.
+- `/api/google-drive/oauth/callback` exchanges the code and stores the Google refresh token **encrypted** in durable Postgres/Neon state.
+- `/api/drive-test` verifies upload + delete.
+- `GDRIVE_REFRESH_TOKEN` remains only as a fallback; after one-click connect, the DB token takes priority.
+- Existing Neon jobs/history, Google Drive media, auto-delete-after-publish, account recovery, scheduler and Meta publishing behavior remain unchanged.
 
-- `state: "postgres"`
-- `media: "gdrive"`
-- `statePersistent: true`
-- `mediaPersistent: true`
-- `restartSafe: true`
-- `safeToSchedule: true`
+## One-time Google Cloud setting
 
-## Google Drive variables
+In Google Cloud → Google Auth Platform → Clients → `Insta Auto Publisher Drive Web`, add this **Authorized redirect URI**:
 
-Set these on Render:
+`https://insta-auto-publisher-backend.onrender.com/api/google-drive/oauth/callback`
 
+If you use another backend hostname, get the exact URI from:
+
+`https://YOUR-BACKEND/api/google-drive/connect-info`
+
+## Then connect Drive
+
+Open:
+
+`https://insta-auto-publisher-backend.onrender.com/api/google-drive/connect`
+
+Choose your Google account and Allow. The backend saves the refresh token encrypted in Postgres.
+
+Then test:
+
+`https://insta-auto-publisher-backend.onrender.com/api/drive-test`
+
+Expected: `ok: true` and `uploadedAndDeleted: true`.
+
+## Required Render env vars
+
+- `APP_SECRET_KEY`
+- `DATABASE_URL`
 - `GDRIVE_CLIENT_ID`
 - `GDRIVE_CLIENT_SECRET`
-- `GDRIVE_REFRESH_TOKEN`
-- `GDRIVE_FOLDER_ID`
+- `GDRIVE_FOLDER_ID` (optional; app can create/reuse its own folder)
+- `KEEP_MEDIA_AFTER_PUBLISH_HOURS=2`
 
-Use Google OAuth scope `https://www.googleapis.com/auth/drive.file`.
-
-For a personal Google account, put the OAuth consent app in **Production** before relying on the refresh token long-term; testing-mode refresh tokens for external apps can expire quickly.
-
-## Storage usage
-
-Set `KEEP_MEDIA_AFTER_PUBLISH_HOURS=2` (or another small number) so media is removed from Drive after all jobs referencing that video are published. This is important for large daily volumes because personal Google Drive has finite storage.
-
-## Important
-
-Do not change `APP_SECRET_KEY` or existing encrypted account recovery blobs may stop decrypting.
+After one-click connect, `GDRIVE_REFRESH_TOKEN` is no longer required.

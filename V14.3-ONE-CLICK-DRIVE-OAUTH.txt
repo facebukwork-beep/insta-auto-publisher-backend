@@ -1,0 +1,7 @@
+v14.3 One-Click Google Drive OAuth
+
+- Eliminates OAuth Playground refresh-token/client mismatch loops.
+- /api/google-drive/connect redirects to Google and stores the returned refresh token encrypted in Neon/Postgres.
+- /api/google-drive/connect-info shows the exact callback URI to add to the Web OAuth client.
+- /api/drive-test verifies upload + delete.
+- Existing GDRIVE_REFRESH_TOKEN remains a fallback only.

@@ -4,14 +4,18 @@ import crypto from "crypto";
 import { Readable } from "stream";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 
-function createGoogleDriveStore() {
+function createGoogleDriveStore({ getRefreshToken } = {}) {
   const clientId = String(process.env.GDRIVE_CLIENT_ID || "").trim();
   const clientSecret = String(process.env.GDRIVE_CLIENT_SECRET || "").trim();
-  const refreshToken = String(process.env.GDRIVE_REFRESH_TOKEN || "").trim();
+  const envRefreshToken = String(process.env.GDRIVE_REFRESH_TOKEN || "").trim();
   const configuredFolderId = String(process.env.GDRIVE_FOLDER_ID || "").trim();
   const folderName = String(process.env.GDRIVE_FOLDER_NAME || "Insta Auto Publisher Media").trim() || "Insta Auto Publisher Media";
-  const configured = Boolean(clientId && clientSecret && refreshToken);
+  const configured = Boolean(clientId && clientSecret);
   if (!configured) return null;
+
+  function currentRefreshToken() {
+    return String((typeof getRefreshToken === "function" ? getRefreshToken() : "") || envRefreshToken || "").trim();
+  }
 
   let cachedToken = null;
   let tokenExpiresAt = 0;
@@ -31,6 +35,8 @@ function createGoogleDriveStore() {
 
   async function accessToken(force = false) {
     if (!force && cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+    const refreshToken = currentRefreshToken();
+    if (!refreshToken) throw new Error("Google Drive is not connected. Open /api/google-drive/connect to authorize Drive.");
     const body = new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
@@ -43,7 +49,11 @@ function createGoogleDriveStore() {
       body
     });
     const j = await readGoogleJson(r);
-    if (!r.ok || !j.access_token) throw googleError("Google OAuth refresh failed", r, j);
+    if (!r.ok || !j.access_token) {
+      const err = googleError("Google OAuth refresh failed", r, j);
+      err.message += " — reconnect at /api/google-drive/connect";
+      throw err;
+    }
     cachedToken = j.access_token;
     tokenExpiresAt = Date.now() + Number(j.expires_in || 3600) * 1000;
     return cachedToken;
@@ -195,7 +205,7 @@ function createGoogleDriveStore() {
 
   return {
     mode: "gdrive",
-    durable: true,
+    get durable() { return Boolean(currentRefreshToken()); },
     publicBase: null,
     async put(file, originalName, baseUrl) {
       const fileId = await uploadResumable(file, originalName);
@@ -221,9 +231,9 @@ function createGoogleDriveStore() {
   };
 }
 
-export function createMediaStore({ mediaDir, persistentRoot }) {
+export function createMediaStore({ mediaDir, persistentRoot, getDriveRefreshToken }) {
   // Prefer Google Drive when explicitly configured. It needs no paid object-storage account.
-  const drive = createGoogleDriveStore();
+  const drive = createGoogleDriveStore({ getRefreshToken: getDriveRefreshToken });
   if (drive) return drive;
 
   const endpoint = String(process.env.S3_ENDPOINT || "").trim();

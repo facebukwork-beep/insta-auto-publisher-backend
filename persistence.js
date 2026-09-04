@@ -9,6 +9,8 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
       mode: "local",
       durable: false,
       persist: async () => {},
+      get: async () => null,
+      set: async () => false,
       flush: async () => {},
       ping: async () => true,
       withSchedulerLock: async (fn) => { await fn(); return true; },
@@ -56,6 +58,19 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
     return tail;
   }
 
+  async function get(key) {
+    const r = await pool.query(`SELECT value FROM app_state WHERE key=$1`, [key]);
+    return r.rows.length ? r.rows[0].value : null;
+  }
+
+  async function set(key, value) {
+    await pool.query(`
+      INSERT INTO app_state(key,value,updated_at) VALUES($1,$2::jsonb,NOW())
+      ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    `, [key, JSON.stringify(value)]);
+    return true;
+  }
+
   async function withSchedulerLock(fn) {
     const client = await pool.connect();
     try {
@@ -72,6 +87,8 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
     mode: "postgres",
     durable: true,
     persist,
+    get,
+    set,
     flush: async () => { await tail; },
     ping: async () => { await pool.query("SELECT 1"); return true; },
     withSchedulerLock,

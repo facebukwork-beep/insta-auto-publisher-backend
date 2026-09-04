@@ -19,6 +19,8 @@ const RATE_LIMIT_BACKOFF_MS = Math.max(5, Number(process.env.META_RATE_LIMIT_BAC
 const MAX_AUTO_RETRIES = Math.max(1, Number(process.env.MAX_AUTO_RETRIES || 8));
 const REQUIRE_RESTART_SAFE_STORAGE = String(process.env.REQUIRE_RESTART_SAFE_STORAGE || "true").toLowerCase() !== "false";
 const KEEP_MEDIA_AFTER_PUBLISH_HOURS = Math.max(0, Number(process.env.KEEP_MEDIA_AFTER_PUBLISH_HOURS || 24));
+const GDRIVE_CLIENT_ID = String(process.env.GDRIVE_CLIENT_ID || "").trim();
+const GDRIVE_CLIENT_SECRET = String(process.env.GDRIVE_CLIENT_SECRET || "").trim();
 
 if (!SECRET) {
   console.error("APP_SECRET_KEY is required.");
@@ -92,7 +94,108 @@ const upload = multer({
 });
 
 persistence = await createPersistence({ dataDir, accountsFile, jobsFile });
-const mediaStore = createMediaStore({ mediaDir, persistentRoot });
+
+let driveRefreshToken = String(process.env.GDRIVE_REFRESH_TOKEN || "").trim();
+try {
+  const saved = await persistence?.get?.("gdrive_oauth");
+  if (saved?.tokenEnc) driveRefreshToken = decrypt(saved.tokenEnc);
+} catch (e) {
+  console.warn("Could not restore Google Drive OAuth token from durable state:", e.message);
+}
+
+async function saveDriveRefreshToken(token) {
+  driveRefreshToken = String(token || "").trim();
+  if (!driveRefreshToken) throw new Error("Google did not return a refresh token.");
+  if (persistence?.durable && persistence?.set) {
+    await persistence.set("gdrive_oauth", { tokenEnc: encrypt(driveRefreshToken), updatedAt: new Date().toISOString() });
+  }
+}
+
+const mediaStore = createMediaStore({ mediaDir, persistentRoot, getDriveRefreshToken: () => driveRefreshToken });
+
+function driveOAuthRedirectUri(req) {
+  return String(process.env.GDRIVE_OAUTH_REDIRECT_URI || `${publicBaseUrl(req)}/api/google-drive/oauth/callback`).trim();
+}
+
+function makeDriveOAuthState() {
+  const ts = Date.now().toString(36);
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const payload = `${ts}.${nonce}`;
+  const sig = crypto.createHmac("sha256", KEY).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function verifyDriveOAuthState(state) {
+  const parts = String(state || "").split(".");
+  if (parts.length !== 3) return false;
+  const [ts, nonce, sig] = parts;
+  const payload = `${ts}.${nonce}`;
+  const expected = crypto.createHmac("sha256", KEY).update(payload).digest("hex");
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"))) return false;
+  } catch { return false; }
+  const created = parseInt(ts, 36);
+  return Number.isFinite(created) && Math.abs(Date.now() - created) < 15 * 60_000;
+}
+
+app.get("/api/google-drive/connect-info", (req, res) => {
+  res.json({
+    ok: true,
+    configured: Boolean(GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET),
+    connected: Boolean(driveRefreshToken),
+    redirectUri: driveOAuthRedirectUri(req),
+    clientIdHint: GDRIVE_CLIENT_ID ? `${GDRIVE_CLIENT_ID.slice(0, 8)}…${GDRIVE_CLIENT_ID.slice(-12)}` : null,
+    connectUrl: `${publicBaseUrl(req)}/api/google-drive/connect`
+  });
+});
+
+app.get("/api/google-drive/connect", (req, res) => {
+  if (!GDRIVE_CLIENT_ID || !GDRIVE_CLIENT_SECRET) {
+    return res.status(409).send("GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET must be configured first.");
+  }
+  const redirectUri = driveOAuthRedirectUri(req);
+  const params = new URLSearchParams({
+    client_id: GDRIVE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "https://www.googleapis.com/auth/drive.file",
+    access_type: "offline",
+    prompt: "consent",
+    include_granted_scopes: "true",
+    state: makeDriveOAuthState()
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+app.get("/api/google-drive/oauth/callback", async (req, res) => {
+  const { code, state, error } = req.query || {};
+  if (error) return res.status(400).send(`Google authorization failed: ${String(error)}`);
+  if (!code || !verifyDriveOAuthState(state)) return res.status(400).send("Invalid or expired Google OAuth callback state.");
+  try {
+    const redirectUri = driveOAuthRedirectUri(req);
+    const body = new URLSearchParams({
+      code: String(code),
+      client_id: GDRIVE_CLIENT_ID,
+      client_secret: GDRIVE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code"
+    });
+    const r = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body
+    });
+    const payload = await r.json().catch(() => ({}));
+    if (!r.ok || !payload.refresh_token) {
+      const detail = payload?.error_description || payload?.error || `HTTP ${r.status}`;
+      throw new Error(`Google token exchange failed: ${detail}`);
+    }
+    await saveDriveRefreshToken(payload.refresh_token);
+    res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><body style="font-family:Arial;background:#08101d;color:#fff;padding:32px"><h1>✅ Google Drive connected</h1><p>The refresh token is now encrypted and saved in your durable Postgres state. You no longer need OAuth Playground or GDRIVE_REFRESH_TOKEN for this connection.</p><p><a style="color:#8ab4ff" href="/api/drive-test">Run Drive test</a></p></body>`);
+  } catch (e) {
+    res.status(502).type("text").send(String(e?.message || e));
+  }
+});
 
 app.get("/drive-media/:fileId", async (req, res) => {
   if (!mediaStore?.stream) return res.status(404).send("Google Drive media storage is not configured.");
@@ -122,12 +225,12 @@ function requireSafeStorage(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.2 Drive Fix Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.3</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.3 One-Click Drive OAuth Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
   const status = storageStatus();
-  res.json({ ok: true, version: "14.2.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "14.3.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/drive-test", async (req, res) => {
@@ -600,4 +703,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.1 durable backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.3 durable backend running on port ${PORT}`));
