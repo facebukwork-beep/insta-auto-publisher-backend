@@ -1,11 +1,29 @@
-V8 BACKEND UPDATE
-1) Extract this ZIP.
-2) Upload the extracted files to the ROOT of your existing GitHub backend repo.
-3) Commit changes.
-4) Render -> Manual Deploy -> Deploy latest commit (if auto deploy does not start).
-5) Wait for Live.
-6) Open /api/health and confirm version is 8.0.0.
+INSTA AUTO PUBLISHER v14.0 - DURABLE / RESTART-SAFE BACKEND
 
+IMPORTANT:
+- Do NOT change APP_SECRET_KEY.
+- v14 blocks NEW scheduling until storage-status says restartSafe=true.
+- Existing local/ephemeral jobs that were already erased cannot be recovered by this update.
 
-## v11.2 account recovery
-Keep APP_SECRET_KEY unchanged on Render. The extension mirrors encrypted per-account recovery blobs to Chrome sync/local storage and automatically restores them when the backend URL is saved or the extension starts. The backend endpoint /api/accounts/recovery-pack never returns a plaintext access token.
+Recommended Render setup:
+1) Create a PostgreSQL database (Neon/Supabase/Render Postgres) and copy DATABASE_URL.
+2) Create an S3-compatible public bucket (Cloudflare R2/S3).
+3) Add these Render Environment Variables:
+   DATABASE_URL
+   S3_ENDPOINT
+   S3_REGION=auto
+   S3_BUCKET
+   S3_ACCESS_KEY_ID
+   S3_SECRET_ACCESS_KEY
+   S3_PUBLIC_BASE_URL
+   S3_FORCE_PATH_STYLE=false
+   REQUIRE_RESTART_SAFE_STORAGE=true
+4) Keep your existing APP_SECRET_KEY exactly unchanged.
+5) Deploy v14.
+6) Open:
+   https://YOUR-BACKEND/api/storage-status
+7) Only bulk schedule when it returns:
+   "restartSafe": true
+   "safeToSchedule": true
+
+Laptop extension and Mobile PWA backend URL do NOT change.

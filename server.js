@@ -6,6 +6,8 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createPersistence } from "./persistence.js";
+import { createMediaStore } from "./media-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 10000);
@@ -15,6 +17,8 @@ const PREPARE_AHEAD_MS = Number(process.env.PREPARE_AHEAD_MINUTES || 10) * 60_00
 const META_MIN_REQUEST_INTERVAL_MS = Math.max(5, Number(process.env.META_MIN_REQUEST_INTERVAL_SECONDS || 10)) * 1000;
 const RATE_LIMIT_BACKOFF_MS = Math.max(5, Number(process.env.META_RATE_LIMIT_BACKOFF_MINUTES || 30)) * 60_000;
 const MAX_AUTO_RETRIES = Math.max(1, Number(process.env.MAX_AUTO_RETRIES || 8));
+const REQUIRE_RESTART_SAFE_STORAGE = String(process.env.REQUIRE_RESTART_SAFE_STORAGE || "true").toLowerCase() !== "false";
+const KEEP_MEDIA_AFTER_PUBLISH_HOURS = Math.max(0, Number(process.env.KEEP_MEDIA_AFTER_PUBLISH_HOURS || 24));
 
 if (!SECRET) {
   console.error("APP_SECRET_KEY is required.");
@@ -22,8 +26,9 @@ if (!SECRET) {
 }
 
 const KEY = crypto.createHash("sha256").update(SECRET, "utf8").digest();
-const dataDir = path.join(__dirname, "data");
-const mediaDir = path.join(__dirname, "media");
+const persistentRoot = String(process.env.PERSISTENT_ROOT || "").trim();
+const dataDir = persistentRoot ? path.join(persistentRoot, "data") : path.join(__dirname, "data");
+const mediaDir = persistentRoot ? path.join(persistentRoot, "media") : path.join(__dirname, "media");
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(mediaDir, { recursive: true });
 
@@ -33,7 +38,15 @@ if (!fs.existsSync(accountsFile)) fs.writeFileSync(accountsFile, "[]");
 if (!fs.existsSync(jobsFile)) fs.writeFileSync(jobsFile, "[]");
 
 const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
-const write = (f, x) => fs.writeFileSync(f, JSON.stringify(x, null, 2));
+let persistence = null;
+const write = (f, x) => {
+  fs.writeFileSync(f, JSON.stringify(x, null, 2));
+  if (persistence) {
+    const key = f === accountsFile ? "accounts" : f === jobsFile ? "jobs" : null;
+    if (key) return persistence.persist(key, x);
+  }
+  return Promise.resolve();
+};
 const newId = () => crypto.randomUUID();
 
 function encrypt(text) {
@@ -78,12 +91,51 @@ const upload = multer({
   limits: { fileSize: 1024 * 1024 * 1024, files: 10 }
 });
 
+persistence = await createPersistence({ dataDir, accountsFile, jobsFile });
+const mediaStore = createMediaStore({ mediaDir, persistentRoot });
+
+function storageStatus() {
+  const statePersistent = Boolean(persistentRoot) || Boolean(persistence?.durable);
+  const mediaPersistent = Boolean(mediaStore?.durable);
+  const restartSafe = statePersistent && mediaPersistent;
+  const reasons = [];
+  if (!statePersistent) reasons.push("State is local/ephemeral. Configure DATABASE_URL or PERSISTENT_ROOT.");
+  if (!mediaPersistent) reasons.push("Media is local/ephemeral. Configure S3/R2 storage or PERSISTENT_ROOT.");
+  return { statePersistent, mediaPersistent, restartSafe, reasons };
+}
+
+function requireSafeStorage(req, res, next) {
+  const status = storageStatus();
+  if (REQUIRE_RESTART_SAFE_STORAGE && !status.restartSafe) {
+    return res.status(503).json({
+      error: "Restart-safe storage is not configured. Bulk scheduling is blocked to prevent queued videos from disappearing after a restart/redeploy.",
+      storage: status
+    });
+  }
+  next();
+}
+
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v11.2</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v11.2 Backend is Live</h1><p>Auto-caption, burst scheduling, published links, and permanent account recovery vault enabled.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.0</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.0 Durable Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, version: "11.2.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  const status = storageStatus();
+  res.json({ ok: true, version: "14.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+});
+
+app.get("/api/storage-status", (req, res) => {
+  const status = storageStatus();
+  res.json({
+    ok: true,
+    state: persistence?.mode || "local",
+    media: mediaStore?.mode || "local",
+    persistentRoot: persistentRoot || null,
+    ...status,
+    safeToSchedule: !REQUIRE_RESTART_SAFE_STORAGE || status.restartSafe,
+    requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE,
+    exactTimingWarning: !process.env.RENDER_INSTANCE_ID ? null : "A sleeping web service can still delay exact-time publishing. Durable storage prevents data loss, not service sleep."
+  });
 });
 
 app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
@@ -108,7 +160,7 @@ app.get("/api/accounts/recovery-pack", (req, res) => {
   });
 });
 
-app.post("/api/accounts/restore", (req, res) => {
+app.post("/api/accounts/restore", async (req, res) => {
   const blobs = Array.isArray(req.body?.backups) ? req.body.backups : [];
   if (!blobs.length) return res.json({ ok: true, restored: 0 });
   const accounts = read(accountsFile);
@@ -125,29 +177,31 @@ app.post("/api/accounts/restore", (req, res) => {
       restored++;
     } catch (_) {}
   }
-  if (restored) write(accountsFile, accounts);
+  if (restored) { await write(accountsFile, accounts); await persistence?.flush?.(); }
   res.json({ ok: true, restored });
 });
 
-app.post("/api/accounts", (req, res) => {
+app.post("/api/accounts", async (req, res) => {
   const { label, igUserId, accessToken } = req.body || {};
   if (!label || !igUserId || !accessToken) return res.status(400).json({ error: "label, igUserId and accessToken are required" });
   const accounts = read(accountsFile);
   const normalizedIgUserId = String(igUserId).trim();
   if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) return res.status(409).json({ error: "This Instagram account is already connected." });
   const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(String(accessToken).trim()), createdAt: new Date().toISOString() };
-  accounts.push(item); write(accountsFile, accounts);
+  accounts.push(item); await write(accountsFile, accounts);
+  await persistence?.flush?.();
   res.json({ id: item.id, label: item.label, igUserId: item.igUserId, backupBlob: makeBackupBlob(item) });
 });
 
-app.delete("/api/accounts/:id", (req, res) => {
+app.delete("/api/accounts/:id", async (req, res) => {
   const accounts = read(accountsFile);
   const account = accounts.find((a) => a.id === req.params.id);
   if (!account) return res.status(404).json({ error: "Account not found." });
   const jobs = read(jobsFile);
   const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "processing", "ready", "publishing", "retry_wait"].includes(j.status));
   if (active) return res.status(409).json({ error: "Finish this account's active jobs before removing it." });
-  write(accountsFile, accounts.filter((a) => a.id !== account.id));
+  await write(accountsFile, accounts.filter((a) => a.id !== account.id));
+  await persistence?.flush?.();
   res.json({ ok: true, removedId: account.id });
 });
 
@@ -156,7 +210,7 @@ app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
 // Manually remove a queued job. We intentionally block jobs that are actively
 // processing/publishing or already published so a user cannot interrupt a Meta
 // API transaction halfway through.
-app.delete("/api/jobs/:id", (req, res) => {
+app.delete("/api/jobs/:id", async (req, res) => {
   const jobs = read(jobsFile);
   const index = jobs.findIndex((j) => j.id === req.params.id);
   if (index < 0) return res.status(404).json({ error: "Job not found." });
@@ -165,23 +219,19 @@ app.delete("/api/jobs/:id", (req, res) => {
     return res.status(409).json({ error: `Cannot delete a ${job.status} job.` });
   }
   const [removed] = jobs.splice(index, 1);
-  write(jobsFile, jobs);
+  await write(jobsFile, jobs);
+  await persistence?.flush?.();
 
-  // Delete the local media file only if no other queued/history job references it.
+  // Remove media only when no other job references the same object.
   if (removed.mediaUrl && !jobs.some((j) => j.mediaUrl === removed.mediaUrl)) {
-    try {
-      const pathname = new URL(removed.mediaUrl).pathname;
-      const name = decodeURIComponent(path.basename(pathname));
-      const filePath = path.join(mediaDir, name);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch (_) {}
+    mediaStore.remove(removed).catch(() => {});
   }
   res.json({ ok: true, deleted: removed.id });
 });
 
 // Ignore the original schedule for one job and move it to the front of the
 // normal smart-rate-limit queue. It still respects Meta throttling/backoff.
-app.post("/api/jobs/:id/post-now", (req, res) => {
+app.post("/api/jobs/:id/post-now", async (req, res) => {
   const jobs = read(jobsFile);
   const job = jobs.find((j) => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found." });
@@ -201,11 +251,12 @@ app.post("/api/jobs/:id/post-now", (req, res) => {
   } else {
     job.status = "scheduled";
   }
-  write(jobsFile, jobs);
+  await write(jobsFile, jobs);
+  await persistence?.flush?.();
   res.json({ ok: true, id: job.id, status: job.status, scheduledAt: job.scheduledAt });
 });
 
-app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
+app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async (req, res) => {
   try {
     const files = req.files || [];
     if (!files.length) throw new Error("At least one video is required.");
@@ -243,12 +294,11 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
     }
 
     const base = publicBaseUrl(req);
-    const storedFiles = files.map((file) => {
-      const ext = path.extname(file.originalname) || ".mp4";
-      const finalName = `${file.filename}${ext}`;
-      fs.renameSync(file.path, path.join(mediaDir, finalName));
-      return { originalname: file.originalname, mediaUrl: `${base}/media/${encodeURIComponent(finalName)}` };
-    });
+    const storedFiles = [];
+    for (const file of files) {
+      const stored = await mediaStore.put(file, file.originalname, base);
+      storedFiles.push({ originalname: file.originalname, mediaUrl: stored.mediaUrl, storageKey: stored.storageKey || null });
+    }
 
     const jobs = read(jobsFile);
     const batchId = cfg.batchId || newId();
@@ -267,6 +317,7 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
           igUserId: account.igUserId,
           fileName: file.originalname,
           mediaUrl: file.mediaUrl,
+          storageKey: file.storageKey || null,
           caption: fileCaption,
           scheduledAt: new Date(scheduleTimes[index++]).toISOString(),
           status: "scheduled",
@@ -286,7 +337,8 @@ app.post("/api/schedule", upload.array("videos", 10), (req, res) => {
       fileIndex++;
     }
 
-    write(jobsFile, jobs);
+    await write(jobsFile, jobs);
+    await persistence?.flush?.();
     res.json({ ok: true, created: totalJobs, videos: files.length, accounts: selected.length, firstScheduledAt: new Date(scheduleTimes[0]).toISOString(), lastScheduledAt: new Date(scheduleTimes[scheduleTimes.length - 1]).toISOString() });
   } catch (error) {
     for (const file of req.files || []) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
@@ -303,7 +355,7 @@ function retryDelayMs(retryCount, rateLimited = false) {
   return Math.min(60 * 60_000, 2 * 60_000 * Math.max(1, Math.pow(2, Math.min(retryCount - 1, 5))));
 }
 
-app.post("/api/jobs/:id/retry", (req, res) => {
+app.post("/api/jobs/:id/retry", async (req, res) => {
   const jobs = read(jobsFile);
   const job = jobs.find(j => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found." });
@@ -313,11 +365,12 @@ app.post("/api/jobs/:id/retry", (req, res) => {
   job.lastErrorType = null;
   job.nextAttemptAt = new Date(Date.now() + 15_000).toISOString();
   job.retryCount = 0;
-  write(jobsFile, jobs);
+  await write(jobsFile, jobs);
+  await persistence?.flush?.();
   res.json({ ok: true, id: job.id, status: job.status });
 });
 
-app.post("/api/jobs/retry-failed", (req, res) => {
+app.post("/api/jobs/retry-failed", async (req, res) => {
   const jobs = read(jobsFile);
   let count = 0;
   for (const job of jobs) {
@@ -329,7 +382,7 @@ app.post("/api/jobs/retry-failed", (req, res) => {
     job.retryCount = 0;
     count++;
   }
-  if (count) write(jobsFile, jobs);
+  if (count) { await write(jobsFile, jobs); await persistence?.flush?.(); }
   res.json({ ok: true, retried: count });
 });
 
@@ -391,7 +444,7 @@ function markRetry(job, error, rateLimited) {
   if (rateLimited) globalBackoffUntil = Math.max(globalBackoffUntil, Date.now() + delay);
 }
 
-async function runScheduler() {
+async function runSchedulerUnlocked() {
   if (busy) return;
   const now = Date.now();
   if (now < globalBackoffUntil) return;
@@ -459,7 +512,8 @@ async function runScheduler() {
           }
         } else if (action === "publish") {
           job.status = "publishing";
-          write(jobsFile, jobs);
+          await write(jobsFile, jobs);
+          await persistence?.flush?.();
           job.publishedMediaId = await publishContainer(job, account);
           job.status = "published";
           job.publishedAt = new Date().toISOString();
@@ -480,13 +534,53 @@ async function runScheduler() {
       break;
     }
 
-    if (changed) write(jobsFile, jobs);
+    if (changed) { await write(jobsFile, jobs); await persistence?.flush?.(); }
   } finally {
     busy = false;
   }
 }
 
-setInterval(runScheduler, 5_000);
-runScheduler();
+async function runScheduler() {
+  if (!persistence?.withSchedulerLock) return runSchedulerUnlocked();
+  return persistence.withSchedulerLock(runSchedulerUnlocked);
+}
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v11.2 backend running on port ${PORT}`));
+async function cleanupPublishedMedia() {
+  if (KEEP_MEDIA_AFTER_PUBLISH_HOURS < 0) return;
+  const jobs = read(jobsFile);
+  const cutoff = Date.now() - KEEP_MEDIA_AFTER_PUBLISH_HOURS * 60 * 60_000;
+  let changed = false;
+  for (const job of jobs) {
+    if (job.status !== "published" || !job.publishedAt || !job.storageKey || job.mediaDeletedAt) continue;
+    if (new Date(job.publishedAt).getTime() > cutoff) continue;
+    // Only remove an object when all jobs referencing it are already published.
+    const siblings = jobs.filter(j => j.mediaUrl === job.mediaUrl);
+    if (!siblings.every(j => j.status === "published")) continue;
+    try {
+      await mediaStore.remove(job);
+      for (const sibling of siblings) {
+        sibling.mediaDeletedAt = new Date().toISOString();
+        sibling.storageKey = null;
+      }
+      changed = true;
+    } catch (e) {
+      console.error("Media cleanup failed:", e.message);
+    }
+  }
+  if (changed) { await write(jobsFile, jobs); await persistence?.flush?.(); }
+}
+
+setInterval(runScheduler, 5_000);
+setInterval(() => cleanupPublishedMedia().catch(e => console.error("Cleanup error:", e.message)), 30 * 60_000);
+runScheduler();
+cleanupPublishedMedia().catch(() => {});
+
+async function gracefulShutdown(signal) {
+  console.log(`${signal}: flushing persistent state...`);
+  try { await persistence?.flush?.(); await persistence?.close?.(); } catch (_) {}
+  process.exit(0);
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.0 durable backend running on port ${PORT}`));

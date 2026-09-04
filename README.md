@@ -1,35 +1,40 @@
-# v10 Smart Rate-Limit Queue
+# Insta Auto Publisher v14.0 — Durable Backend
 
-This version performs at most one Meta API action at a time, spaces API requests, automatically backs off on rate-limit responses, retries transient failures, and exposes manual retry endpoints. It does not bypass Meta limits; it slows down to respect them.
+This release prevents the main failure mode of earlier versions: accounts/jobs/video files disappearing after a Render restart or redeploy.
 
-# v9 hotfix
+## What changed
 
-Uses `graph.instagram.com` for Instagram Login tokens (`instagram_business_*`) and trims pasted access tokens before encrypting/storing them.
+- PostgreSQL-backed account/job state (`DATABASE_URL`)
+- S3-compatible persistent public video storage (Cloudflare R2 / S3)
+- Safe scheduling gate: by default `/api/schedule` is blocked until **both** state and media are restart-safe
+- Important API mutations wait for durable state flush before returning success
+- Scheduler remains advisory-lock protected when PostgreSQL is enabled
+- Published media objects can be cleaned automatically after `KEEP_MEDIA_AFTER_PUBLISH_HOURS`
+- `/api/storage-status` tells you whether it is actually safe to bulk schedule
 
-# Insta Auto Publisher v9 — Render Backend
+## Two supported durable modes
 
-New in v9:
-- Exact local-time fix: browser converts the chosen local time to ISO/UTC before sending it to Render, removing server-timezone drift.
-- Future posts are pre-processed up to 10 minutes early, then `media_publish` is called at the scheduled time.
-- Selecting the current minute starts publishing immediately instead of moving the job to a later time.
-- Multiple videos + multiple accounts: every selected video is scheduled to every selected account (max 30 videos, 15 accounts, 300 generated jobs per batch).
-- Duplicate-account protection and account removal remain enabled.
+### A. Persistent disk
+Set `PERSISTENT_ROOT=/var/data` and mount a real persistent disk there. This stores state + media on one disk.
 
-## Render
-Build: `npm install`
-Start: `npm start`
+### B. PostgreSQL + S3/R2 (recommended on a stateless Render web service)
+Set `DATABASE_URL` plus the S3 variables from `.env.example`.
 
-Required env vars:
-- `APP_SECRET_KEY` — any strong secret (Render can generate one)
-- `GRAPH_API_VERSION` — e.g. `v23.0`
+For Instagram publishing, `S3_PUBLIC_BASE_URL` must serve files publicly because Meta fetches the video URL from its own servers.
 
-Optional:
-- `PREPARE_AHEAD_MINUTES=10`
-- `PUBLIC_BASE_URL` (normally not needed on Render; `RENDER_EXTERNAL_URL` is detected automatically)
+## Safety check
 
-## Important reliability note
-A free Render web service can sleep when inactive. Exact unattended posting cannot be guaranteed while the service is asleep. An always-on instance is recommended for timing-sensitive production use. Render's local filesystem is also ephemeral, so production use should move accounts/jobs/media to persistent storage.
+After deploy, open `/api/storage-status`. Do not bulk schedule until you see:
 
+```json
+{
+  "restartSafe": true,
+  "safeToSchedule": true
+}
+```
 
-## v11.2 account recovery
-Keep APP_SECRET_KEY unchanged on Render. The extension mirrors encrypted per-account recovery blobs to Chrome sync/local storage and automatically restores them when the backend URL is saved or the extension starts. The backend endpoint /api/accounts/recovery-pack never returns a plaintext access token.
+If storage is not durable, v14 returns HTTP 503 for new scheduling instead of accepting hundreds of jobs that could later disappear.
+
+## Existing extensions
+
+The laptop extension and mobile PWA can keep using the same backend URL and API. No UI update is required for v14.

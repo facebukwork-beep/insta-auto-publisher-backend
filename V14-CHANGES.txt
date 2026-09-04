@@ -1,0 +1,7 @@
+v14.0 DURABLE STORAGE SAFETY
+- Blocks unsafe scheduling unless restart-safe storage is configured
+- PostgreSQL state persistence and S3/R2 media persistence supported
+- Durable flush before schedule/account mutations return success
+- Automatic old published-media cleanup
+- Expanded /api/storage-status diagnostics
+- Same API compatibility with laptop extension + mobile PWA
