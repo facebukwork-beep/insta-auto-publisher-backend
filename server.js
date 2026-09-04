@@ -94,13 +94,19 @@ const upload = multer({
 persistence = await createPersistence({ dataDir, accountsFile, jobsFile });
 const mediaStore = createMediaStore({ mediaDir, persistentRoot });
 
+app.get("/drive-media/:fileId", async (req, res) => {
+  if (!mediaStore?.stream) return res.status(404).send("Google Drive media storage is not configured.");
+  try { await mediaStore.stream(req.params.fileId, req, res); }
+  catch (e) { if (!res.headersSent) res.status(502).send(`Drive media proxy error: ${e.message}`); else res.end(); }
+});
+
 function storageStatus() {
   const statePersistent = Boolean(persistentRoot) || Boolean(persistence?.durable);
   const mediaPersistent = Boolean(mediaStore?.durable);
   const restartSafe = statePersistent && mediaPersistent;
   const reasons = [];
   if (!statePersistent) reasons.push("State is local/ephemeral. Configure DATABASE_URL or PERSISTENT_ROOT.");
-  if (!mediaPersistent) reasons.push("Media is local/ephemeral. Configure S3/R2 storage or PERSISTENT_ROOT.");
+  if (!mediaPersistent) reasons.push("Media is local/ephemeral. Configure Google Drive, S3/R2 storage, or PERSISTENT_ROOT.");
   return { statePersistent, mediaPersistent, restartSafe, reasons };
 }
 
@@ -116,12 +122,12 @@ function requireSafeStorage(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.0</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.0 Durable Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.1 Durable Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
   const status = storageStatus();
-  res.json({ ok: true, version: "14.0.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "14.1.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/storage-status", (req, res) => {
@@ -583,4 +589,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.0 durable backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.1 durable backend running on port ${PORT}`));

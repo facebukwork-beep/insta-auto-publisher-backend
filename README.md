@@ -1,40 +1,37 @@
-# Insta Auto Publisher v14.0 — Durable Backend
+# Insta Auto Publisher v14.1 — Neon + Google Drive Durable Backend
 
-This release prevents the main failure mode of earlier versions: accounts/jobs/video files disappearing after a Render restart or redeploy.
+This version supports a no-R2-payment path:
 
-## What changed
+- **Neon PostgreSQL**: accounts, scheduled jobs, published history, scheduler state
+- **Google Drive**: video files
+- **Render**: API + scheduler + secure media proxy to Meta/Instagram
 
-- PostgreSQL-backed account/job state (`DATABASE_URL`)
-- S3-compatible persistent public video storage (Cloudflare R2 / S3)
-- Safe scheduling gate: by default `/api/schedule` is blocked until **both** state and media are restart-safe
-- Important API mutations wait for durable state flush before returning success
-- Scheduler remains advisory-lock protected when PostgreSQL is enabled
-- Published media objects can be cleaned automatically after `KEEP_MEDIA_AFTER_PUBLISH_HOURS`
-- `/api/storage-status` tells you whether it is actually safe to bulk schedule
+When `DATABASE_URL` and the four `GDRIVE_*` variables are configured, `/api/storage-status` should report:
 
-## Two supported durable modes
+- `state: "postgres"`
+- `media: "gdrive"`
+- `statePersistent: true`
+- `mediaPersistent: true`
+- `restartSafe: true`
+- `safeToSchedule: true`
 
-### A. Persistent disk
-Set `PERSISTENT_ROOT=/var/data` and mount a real persistent disk there. This stores state + media on one disk.
+## Google Drive variables
 
-### B. PostgreSQL + S3/R2 (recommended on a stateless Render web service)
-Set `DATABASE_URL` plus the S3 variables from `.env.example`.
+Set these on Render:
 
-For Instagram publishing, `S3_PUBLIC_BASE_URL` must serve files publicly because Meta fetches the video URL from its own servers.
+- `GDRIVE_CLIENT_ID`
+- `GDRIVE_CLIENT_SECRET`
+- `GDRIVE_REFRESH_TOKEN`
+- `GDRIVE_FOLDER_ID`
 
-## Safety check
+Use Google OAuth scope `https://www.googleapis.com/auth/drive.file`.
 
-After deploy, open `/api/storage-status`. Do not bulk schedule until you see:
+For a personal Google account, put the OAuth consent app in **Production** before relying on the refresh token long-term; testing-mode refresh tokens for external apps can expire quickly.
 
-```json
-{
-  "restartSafe": true,
-  "safeToSchedule": true
-}
-```
+## Storage usage
 
-If storage is not durable, v14 returns HTTP 503 for new scheduling instead of accepting hundreds of jobs that could later disappear.
+Set `KEEP_MEDIA_AFTER_PUBLISH_HOURS=2` (or another small number) so media is removed from Drive after all jobs referencing that video are published. This is important for large daily volumes because personal Google Drive has finite storage.
 
-## Existing extensions
+## Important
 
-The laptop extension and mobile PWA can keep using the same backend URL and API. No UI update is required for v14.
+Do not change `APP_SECRET_KEY` or existing encrypted account recovery blobs may stop decrypting.

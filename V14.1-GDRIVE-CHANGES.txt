@@ -1,0 +1,16 @@
+V14.1 Google Drive Media Storage
+
+- Keeps Neon/Postgres for durable accounts/jobs/history.
+- Adds Google Drive as a durable media store without requiring a paid R2 subscription.
+- Videos are uploaded to a Drive folder through OAuth and served to Meta through the backend's /drive-media/:fileId proxy.
+- HTTP Range requests are proxied so Instagram can fetch/process video files reliably.
+- Published video objects are automatically deleted after KEEP_MEDIA_AFTER_PUBLISH_HOURS once every sibling job using that media is published.
+- storage-status reports media=gdrive, mediaPersistent=true, restartSafe=true when DATABASE_URL + Drive credentials are configured.
+
+Required Render env vars:
+GDRIVE_CLIENT_ID
+GDRIVE_CLIENT_SECRET
+GDRIVE_REFRESH_TOKEN
+GDRIVE_FOLDER_ID (recommended)
+
+Keep APP_SECRET_KEY unchanged.
