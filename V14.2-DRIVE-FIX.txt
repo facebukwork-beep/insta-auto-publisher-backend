@@ -1,0 +1,7 @@
+v14.2 Google Drive Fix
+
+- Fixes drive.file + manually-created-folder incompatibility by automatically reusing/creating an app-owned Drive folder when needed.
+- Adds /api/drive-test for a tiny upload/delete health check.
+- Retries Google OAuth access token once on HTTP 401.
+- Surfaces detailed Google API errors instead of generic Bad Request.
+- Keeps Neon persistence, Google Drive media, scheduler, account recovery and auto-delete behavior.

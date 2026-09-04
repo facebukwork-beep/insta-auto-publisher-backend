@@ -122,12 +122,23 @@ function requireSafeStorage(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.1 Durable Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.1</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.2 Drive Fix Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
   const status = storageStatus();
-  res.json({ ok: true, version: "14.1.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "14.2.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+});
+
+app.get("/api/drive-test", async (req, res) => {
+  if (mediaStore?.mode !== "gdrive" || typeof mediaStore.selfTest !== "function") return res.status(409).json({ ok:false, error:"Google Drive media storage is not configured." });
+  try {
+    const result = await mediaStore.selfTest();
+    const folder = typeof mediaStore.folderInfo === "function" ? await mediaStore.folderInfo() : {};
+    res.json({ ok:true, ...result, ...folder });
+  } catch (e) {
+    res.status(502).json({ ok:false, error:String(e?.message || e) });
+  }
 });
 
 app.get("/api/storage-status", (req, res) => {
