@@ -1,0 +1,7 @@
+v14.4
+- Global persistent Pause All Posting / Resume Posting controls.
+- Pause state is stored in Postgres and survives restart/redeploy.
+- Resume shifts remaining schedule by the paused duration.
+- Automatic wake catch-up protection detects overdue queues after Render sleep and re-spaces each account using 5 posts at 10-minute gaps, then a 1-hour break.
+- Prevents an old backlog from being published all at once when the dashboard wakes the backend.
+- Existing Neon + Google Drive + one-click OAuth preserved.

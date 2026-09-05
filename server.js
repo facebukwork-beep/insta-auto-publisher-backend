@@ -21,6 +21,11 @@ const REQUIRE_RESTART_SAFE_STORAGE = String(process.env.REQUIRE_RESTART_SAFE_STO
 const KEEP_MEDIA_AFTER_PUBLISH_HOURS = Math.max(0, Number(process.env.KEEP_MEDIA_AFTER_PUBLISH_HOURS || 24));
 const GDRIVE_CLIENT_ID = String(process.env.GDRIVE_CLIENT_ID || "").trim();
 const GDRIVE_CLIENT_SECRET = String(process.env.GDRIVE_CLIENT_SECRET || "").trim();
+const LATE_JOB_GRACE_MS = Math.max(30, Number(process.env.LATE_JOB_GRACE_SECONDS || 120)) * 1000;
+const CATCHUP_START_DELAY_MS = Math.max(15, Number(process.env.CATCHUP_START_DELAY_SECONDS || 60)) * 1000;
+const BURST_SIZE = Math.max(1, Number(process.env.SCHEDULER_BURST_SIZE || 5));
+const BURST_GAP_MINUTES = Math.max(1, Number(process.env.SCHEDULER_BURST_GAP_MINUTES || 10));
+const BURST_BREAK_MINUTES = Math.max(BURST_GAP_MINUTES, Number(process.env.SCHEDULER_BURST_BREAK_MINUTES || 60));
 
 if (!SECRET) {
   console.error("APP_SECRET_KEY is required.");
@@ -94,6 +99,59 @@ const upload = multer({
 });
 
 persistence = await createPersistence({ dataDir, accountsFile, jobsFile });
+
+let schedulerControl = { paused: false, pausedAt: null, resumedAt: null, updatedAt: new Date().toISOString() };
+try {
+  const savedControl = await persistence?.get?.("scheduler_control");
+  if (savedControl && typeof savedControl === "object") schedulerControl = { ...schedulerControl, ...savedControl };
+} catch (e) {
+  console.warn("Could not restore scheduler control state:", e.message);
+}
+async function saveSchedulerControl() {
+  schedulerControl.updatedAt = new Date().toISOString();
+  if (persistence?.set) await persistence.set("scheduler_control", schedulerControl);
+}
+
+const ACTIVE_QUEUE_STATUSES = new Set(["scheduled", "processing", "ready", "retry_wait"]);
+function burstOffsetMs(index) {
+  const group = Math.floor(index / BURST_SIZE);
+  const within = index % BURST_SIZE;
+  const groupSpan = ((BURST_SIZE - 1) * BURST_GAP_MINUTES + BURST_BREAK_MINUTES) * 60_000;
+  return group * groupSpan + within * BURST_GAP_MINUTES * 60_000;
+}
+function resetPreparedContainerIfTooEarly(job, now) {
+  const dueAt = new Date(job.scheduledAt).getTime();
+  if (!job.containerId || dueAt - now <= PREPARE_AHEAD_MS) return;
+  job.containerId = null;
+  job.preparedAt = null;
+  job.readyAt = null;
+  job.status = "scheduled";
+  job.nextAttemptAt = null;
+}
+function rebaseAccountQueue(jobs, accountId, startAt, reason) {
+  const queue = jobs
+    .filter(j => j.accountId === accountId && ACTIVE_QUEUE_STATUSES.has(j.status))
+    .sort((a,b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+  if (!queue.length) return 0;
+  const now = Date.now();
+  queue.forEach((job, index) => {
+    job.scheduledAt = new Date(startAt + burstOffsetMs(index)).toISOString();
+    job.catchupReason = reason;
+    job.catchupRebasedAt = new Date().toISOString();
+    resetPreparedContainerIfTooEarly(job, now);
+  });
+  return queue.length;
+}
+function rebaseLateBacklog(jobs, now, reason = "late_wake_catchup") {
+  const lateAccounts = [...new Set(jobs
+    .filter(j => ACTIVE_QUEUE_STATUSES.has(j.status) && new Date(j.scheduledAt).getTime() < now - LATE_JOB_GRACE_MS)
+    .map(j => j.accountId))];
+  if (!lateAccounts.length) return 0;
+  let changed = 0;
+  const firstAt = now + CATCHUP_START_DELAY_MS;
+  for (const accountId of lateAccounts) changed += rebaseAccountQueue(jobs, accountId, firstAt, reason);
+  return changed;
+}
 
 let driveRefreshToken = String(process.env.GDRIVE_REFRESH_TOKEN || "").trim();
 try {
@@ -225,12 +283,12 @@ function requireSafeStorage(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.3</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.3 One-Click Drive OAuth Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. New schedules can be blocked until storage is truly restart-safe.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.3</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.4 Pause/Resume + Catch-up Protection Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. Includes global Pause/Resume and wake catch-up protection so overdue jobs are re-spaced instead of publishing in a burst.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
   const status = storageStatus();
-  res.json({ ok: true, version: "14.3.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "14.4.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/drive-test", async (req, res) => {
@@ -323,6 +381,65 @@ app.delete("/api/accounts/:id", async (req, res) => {
   await write(accountsFile, accounts.filter((a) => a.id !== account.id));
   await persistence?.flush?.();
   res.json({ ok: true, removedId: account.id });
+});
+
+app.get("/api/scheduler/status", (req, res) => {
+  const jobs = read(jobsFile);
+  const now = Date.now();
+  const active = jobs.filter(j => ACTIVE_QUEUE_STATUSES.has(j.status));
+  const overdue = active.filter(j => new Date(j.scheduledAt).getTime() < now - LATE_JOB_GRACE_MS).length;
+  res.json({
+    ok: true,
+    paused: Boolean(schedulerControl.paused),
+    pausedAt: schedulerControl.pausedAt || null,
+    resumedAt: schedulerControl.resumedAt || null,
+    activeJobs: active.length,
+    overdueJobs: overdue,
+    catchupProtection: true,
+    lateGraceSeconds: LATE_JOB_GRACE_MS / 1000,
+    catchupStartDelaySeconds: CATCHUP_START_DELAY_MS / 1000,
+    pattern: { burstSize: BURST_SIZE, gapMinutes: BURST_GAP_MINUTES, breakMinutes: BURST_BREAK_MINUTES }
+  });
+});
+
+app.post("/api/scheduler/pause", async (req, res) => {
+  if (!schedulerControl.paused) {
+    schedulerControl.paused = true;
+    schedulerControl.pausedAt = new Date().toISOString();
+    await saveSchedulerControl();
+  }
+  res.json({ ok: true, paused: true, pausedAt: schedulerControl.pausedAt });
+});
+
+app.post("/api/scheduler/resume", async (req, res) => {
+  const now = Date.now();
+  const jobs = read(jobsFile);
+  let shifted = 0;
+  if (schedulerControl.paused && schedulerControl.pausedAt) {
+    const pauseStarted = new Date(schedulerControl.pausedAt).getTime();
+    const pauseDuration = Number.isFinite(pauseStarted) ? Math.max(0, now - pauseStarted) : 0;
+    if (pauseDuration > 0) {
+      for (const job of jobs) {
+        if (!ACTIVE_QUEUE_STATUSES.has(job.status)) continue;
+        const t = new Date(job.scheduledAt).getTime();
+        if (Number.isFinite(t)) {
+          job.scheduledAt = new Date(t + pauseDuration).toISOString();
+          if (job.nextAttemptAt) {
+            const n = new Date(job.nextAttemptAt).getTime();
+            if (Number.isFinite(n)) job.nextAttemptAt = new Date(n + pauseDuration).toISOString();
+          }
+          shifted++;
+        }
+      }
+    }
+  }
+  const rebased = rebaseLateBacklog(jobs, now, "manual_resume_catchup");
+  if (shifted || rebased) { await write(jobsFile, jobs); await persistence?.flush?.(); }
+  schedulerControl.paused = false;
+  schedulerControl.pausedAt = null;
+  schedulerControl.resumedAt = new Date().toISOString();
+  await saveSchedulerControl();
+  res.json({ ok: true, paused: false, shiftedJobs: shifted, rebasedJobs: rebased, resumedAt: schedulerControl.resumedAt });
 });
 
 app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
@@ -566,6 +683,7 @@ function markRetry(job, error, rateLimited) {
 
 async function runSchedulerUnlocked() {
   if (busy) return;
+  if (schedulerControl.paused) return;
   const now = Date.now();
   if (now < globalBackoffUntil) return;
   if (now - lastMetaRequestAt < META_MIN_REQUEST_INTERVAL_MS) return;
@@ -574,6 +692,12 @@ async function runSchedulerUnlocked() {
     const accounts = read(accountsFile);
     const jobs = read(jobsFile);
     let changed = false;
+
+    // Render Free can sleep. If the service wakes with old overdue jobs, never
+    // dump the backlog immediately. Rebuild each affected account timeline from
+    // now using the configured 5x10-minute + 1-hour-break burst pattern.
+    const rebasedLate = rebaseLateBacklog(jobs, now, "automatic_wake_catchup");
+    if (rebasedLate) changed = true;
 
     // Wake retry jobs only when their backoff has elapsed.
     for (const job of jobs) {
@@ -703,4 +827,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.3 durable backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.4 durable backend running on port ${PORT}`));
