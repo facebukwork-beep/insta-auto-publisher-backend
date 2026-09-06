@@ -1,21 +1,16 @@
 {
-  "name": "insta-auto-publisher-server",
-  "version": "14.8.0",
+  "name": "insta-auto-publisher-cloudflare-worker",
+  "version": "15.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js && node --check persistence.js && node --check media-store.js"
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --test-scheduled"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.883.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1",
-    "pg": "^8.16.3"
+    "@neondatabase/serverless": "^1.0.1"
   },
-  "engines": {
-    "node": ">=20"
+  "devDependencies": {
+    "wrangler": "^4.68.0"
   }
 }
