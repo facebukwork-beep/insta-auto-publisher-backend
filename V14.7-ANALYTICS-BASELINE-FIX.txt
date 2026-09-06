@@ -1,0 +1,8 @@
+Insta Auto Publisher v14.7 — Analytics Baseline Fix
+
+- Fixes false follower gain such as +10,224 caused by treating Instagram follower_count insight series as an absolute historical follower total.
+- Uses the profile followers_count field for current followers.
+- Captures one immutable per-account baseline in durable Postgres on the first v14.7 analytics check.
+- Existing scheduler, jobs, monthly plans, pause/resume, Drive media storage and publishing logic are unchanged from v14.6.
+- Adds followersChangeSinceLastCheck and a read-only /api/analytics-baselines endpoint.
+- Historical follower gain before the first v14.7 snapshot cannot be reconstructed accurately unless an earlier absolute follower snapshot was stored.

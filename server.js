@@ -526,9 +526,11 @@ app.get("/api/published-stats", (req, res) => {
   res.json({ ok:true, tzOffsetMinutes: offset, accounts: rows, todayTotal: rows.reduce((n,r)=>n+r.today,0), totalPublished: rows.reduce((n,r)=>n+r.total,0) });
 });
 
-// Optional follower-growth analytics. This is deliberately isolated from the
-// scheduler. If Meta Insights permission is unavailable, the endpoint falls
-// back to a durable "first successful check" baseline rather than touching jobs.
+// Optional follower-growth analytics. This endpoint is isolated from the
+// scheduler and never edits scheduled jobs. v14.7 fixes the old baseline bug:
+// Instagram's follower_count insight series must not be treated as an absolute
+// historical follower total. Accurate growth tracking now uses an immutable,
+// durable follower snapshot captured from the profile's followers_count field.
 app.get("/api/account-analytics", async (req, res) => {
   const accountId = String(req.query.accountId || "").trim();
   const accounts = read(accountsFile);
@@ -551,6 +553,9 @@ app.get("/api/account-analytics", async (req, res) => {
     profile = await graph(`${account.igUserId}`, { fields: "username,followers_count,follows_count,media_count" }, token, "GET");
   } catch (e) { profileError = e; }
 
+  // Reach/profile views remain historical Meta Insights metrics. follower_count
+  // is intentionally NOT used for the baseline because its day-series values
+  // are not a reliable absolute follower snapshot for this purpose.
   let insights = null, insightsError = null;
   const now = Date.now();
   const earliestAllowed = now - 89 * 86_400_000;
@@ -558,53 +563,80 @@ app.get("/api/account-analytics", async (req, res) => {
   const sinceMs = Math.max(Number.isFinite(firstMs) ? firstMs : now, earliestAllowed);
   try {
     insights = await graph(`${account.igUserId}/insights`, {
-      metric: "follower_count,reach,profile_views",
+      metric: "reach,profile_views",
       period: "day",
       since: Math.floor(sinceMs / 1000),
       until: Math.floor(now / 1000)
     }, token, "GET");
   } catch (e) { insightsError = e; }
 
-  const followerSeries = metricSeriesNumbers(insights, "follower_count");
-  const followerLatestInsight = metricLatestNumber(insights, "follower_count");
   const reachLatest = metricLatestNumber(insights, "reach");
   const profileViewsLatest = metricLatestNumber(insights, "profile_views");
-
   let currentFollowers = Number(profile?.followers_count);
-  if (!Number.isFinite(currentFollowers)) currentFollowers = followerLatestInsight?.value;
   if (!Number.isFinite(currentFollowers)) currentFollowers = null;
 
+  // v2 baseline namespace deliberately ignores the old v14.6 baseline logic.
+  // A baseline is written exactly once per connected account and survives
+  // Render restarts/redeploys through the existing durable Postgres layer.
   let baselines = {};
-  try { baselines = (await persistence?.get?.("analytics_baselines")) || {}; } catch (_) {}
+  try { baselines = (await persistence?.get?.("analytics_baselines_v2")) || {}; } catch (_) {}
   if (!baselines || typeof baselines !== "object" || Array.isArray(baselines)) baselines = {};
-  let baselineFollowers = null, baselineAt = null, baselineSource = null;
 
-  if (followerSeries.length) {
-    baselineFollowers = followerSeries[0].value;
-    baselineAt = followerSeries[0].at || new Date(sinceMs).toISOString();
-    baselineSource = "instagram_insights_history";
+  let baselineFollowers = null, baselineAt = null, baselineSource = null;
+  const saved = baselines[account.id];
+  if (saved && Number.isFinite(Number(saved.followers)) && Number(saved.followers) > 0) {
+    baselineFollowers = Number(saved.followers);
+    baselineAt = saved.at || null;
+    baselineSource = "durable_tracking_baseline_v2";
   } else if (Number.isFinite(currentFollowers)) {
-    const saved = baselines[account.id];
-    if (saved && Number.isFinite(Number(saved.followers))) {
-      baselineFollowers = Number(saved.followers);
-      baselineAt = saved.at || null;
-      baselineSource = "durable_tracking_baseline";
-    } else {
-      baselineFollowers = currentFollowers;
-      baselineAt = new Date().toISOString();
-      baselineSource = "tracking_started_now";
-      baselines[account.id] = { followers: currentFollowers, at: baselineAt, igUserId: account.igUserId };
-      try { await persistence?.set?.("analytics_baselines", baselines); } catch (_) {}
+    baselineFollowers = currentFollowers;
+    baselineAt = new Date().toISOString();
+    baselineSource = "tracking_started_v14_7";
+    baselines[account.id] = {
+      followers: currentFollowers,
+      at: baselineAt,
+      igUserId: account.igUserId,
+      label: account.label || null,
+      firstPublishedAt: firstPublishedAt || null
+    };
+    try { await persistence?.set?.("analytics_baselines_v2", baselines); } catch (_) {}
+  }
+
+  // Keep lightweight durable samples so the dashboard can show change since
+  // the previous successful analytics check without affecting the scheduler.
+  let samples = {};
+  try { samples = (await persistence?.get?.("analytics_follower_samples_v2")) || {}; } catch (_) {}
+  if (!samples || typeof samples !== "object" || Array.isArray(samples)) samples = {};
+  const accountSamples = Array.isArray(samples[account.id]) ? samples[account.id] : [];
+  const previousSample = accountSamples.length ? accountSamples[accountSamples.length - 1] : null;
+  let followersChangeSinceLastCheck = null;
+  if (Number.isFinite(currentFollowers) && previousSample && Number.isFinite(Number(previousSample.followers))) {
+    followersChangeSinceLastCheck = currentFollowers - Number(previousSample.followers);
+  }
+  if (Number.isFinite(currentFollowers)) {
+    const last = accountSamples[accountSamples.length - 1];
+    // Avoid writing duplicate samples for repeated refreshes within 15 minutes
+    // when the follower count is unchanged.
+    const shouldAppend = !last || Number(last.followers) !== currentFollowers || (now - new Date(last.at || 0).getTime()) >= 15 * 60_000;
+    if (shouldAppend) {
+      accountSamples.push({ followers: currentFollowers, at: new Date().toISOString() });
+      samples[account.id] = accountSamples.slice(-500);
+      try { await persistence?.set?.("analytics_follower_samples_v2", samples); } catch (_) {}
     }
   }
 
-  const followersGain = Number.isFinite(currentFollowers) && Number.isFinite(baselineFollowers) ? currentFollowers - baselineFollowers : null;
+  const followersGain = Number.isFinite(currentFollowers) && Number.isFinite(baselineFollowers)
+    ? currentFollowers - baselineFollowers
+    : null;
   const permissionNeeded = Boolean(insightsError) && /permission|insight|scope|access/i.test(String(insightsError.message || insightsError));
+
   let note = "";
-  if (baselineSource === "instagram_insights_history") note = "Follower gain uses available Instagram Insights history (up to Meta's retained history window).";
-  else if (baselineSource === "durable_tracking_baseline") note = `Follower gain is tracked from ${baselineAt ? new Date(baselineAt).toLocaleDateString("en-US") : "the first successful check"}.`;
-  else if (baselineSource === "tracking_started_now") note = "Historical follower baseline was unavailable, so durable follower tracking starts from this check.";
-  if (permissionNeeded) note += `${note ? " " : ""}For historical reach/profile/follower insights, add instagram_business_manage_insights and reconnect/regenerate the Instagram token.`;
+  if (baselineSource === "tracking_started_v14_7") {
+    note = "Accurate follower tracking starts from this snapshot because an absolute follower baseline was not stored before v14.7.";
+  } else if (baselineSource === "durable_tracking_baseline_v2") {
+    note = `Follower gain is tracked from the durable baseline saved at ${baselineAt || "the first v14.7 analytics check"}.`;
+  }
+  if (permissionNeeded) note += `${note ? " " : ""}For reach/profile insights, add instagram_business_manage_insights and reconnect/regenerate the Instagram token.`;
   if (!currentFollowers && profileError) note += `${note ? " " : ""}${profileError.message}`;
 
   res.json({
@@ -619,6 +651,7 @@ app.get("/api/account-analytics", async (req, res) => {
     baselineAt,
     baselineSource,
     followersGain,
+    followersChangeSinceLastCheck,
     currentMediaCount: Number.isFinite(Number(profile?.media_count)) ? Number(profile.media_count) : null,
     reachToday: reachLatest?.value ?? null,
     profileViewsToday: profileViewsLatest?.value ?? null,
@@ -626,6 +659,13 @@ app.get("/api/account-analytics", async (req, res) => {
     insightsError: insightsError ? String(insightsError.message || insightsError) : null,
     note
   });
+});
+
+// Read-only baseline inspection endpoint for debugging/dashboard use.
+app.get("/api/analytics-baselines", async (req, res) => {
+  let baselines = {};
+  try { baselines = (await persistence?.get?.("analytics_baselines_v2")) || {}; } catch (_) {}
+  res.json({ ok: true, baselines });
 });
 
 // Summaries for long-running Monthly Smart 24H plans. The actual schedule is
@@ -1072,4 +1112,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.6 monthly-smart backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.7 analytics-baseline-fix backend running on port ${PORT}`));

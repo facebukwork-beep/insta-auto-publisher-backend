@@ -1,4 +1,4 @@
-# Insta Auto Publisher Backend v14.6 — Additive Analytics
+# Insta Auto Publisher Backend v14.7 — Additive Analytics
 
 This build keeps the v14.5 scheduler unchanged and only adds read-only published statistics plus optional follower-growth analytics endpoints.
 
@@ -25,3 +25,7 @@ Keep your working `APP_SECRET_KEY`, `DATABASE_URL`, `GRAPH_API_VERSION`, `GDRIVE
 
 ## Timing note
 Durable storage prevents data loss. Exact scheduled-time execution still requires the backend process to stay awake; a sleeping free Render service can delay jobs.
+
+
+## v14.7 analytics baseline fix
+Follower gain now uses a durable absolute follower-count snapshot. The scheduler/publishing engine is unchanged from v14.6.
