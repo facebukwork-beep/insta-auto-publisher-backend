@@ -1,0 +1,13 @@
+{
+  "name": "fb-auto-publisher",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "NODE_ENV=development node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
