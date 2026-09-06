@@ -37,17 +37,8 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     if (!force && cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
     const refreshToken = currentRefreshToken();
     if (!refreshToken) throw new Error("Google Drive is not connected. Open /api/google-drive/connect to authorize Drive.");
-    const body = new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token"
-    });
-    const r = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body
-    });
+    const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: "refresh_token" });
+    const r = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body });
     const j = await readGoogleJson(r);
     if (!r.ok || !j.access_token) {
       const err = googleError("Google OAuth refresh failed", r, j);
@@ -87,11 +78,7 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
   }
 
   async function createAppFolder() {
-    const r = await driveFetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=UTF-8" },
-      body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" })
-    });
+    const r = await driveFetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType", { method: "POST", headers: { "Content-Type": "application/json; charset=UTF-8" }, body: JSON.stringify({ name: folderName, mimeType: "application/vnd.google-apps.folder" }) });
     const j = await readGoogleJson(r);
     if (!r.ok || !j.id) throw googleError("Google Drive folder creation failed", r, j);
     return j.id;
@@ -101,18 +88,9 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     if (cachedFolderId) return cachedFolderId;
     if (folderPromise) return folderPromise;
     folderPromise = (async () => {
-      // drive.file cannot always use a folder that was manually created outside the app.
-      // Prefer the configured folder when accessible; otherwise automatically reuse/create
-      // an app-owned folder that drive.file is guaranteed to manage.
-      if (configuredFolderId && await folderUsable(configuredFolderId)) {
-        cachedFolderId = configuredFolderId;
-        return cachedFolderId;
-      }
+      if (configuredFolderId && await folderUsable(configuredFolderId)) { cachedFolderId = configuredFolderId; return cachedFolderId; }
       const found = await findAppFolder();
-      if (found) {
-        cachedFolderId = found;
-        return cachedFolderId;
-      }
+      if (found) { cachedFolderId = found; return cachedFolderId; }
       cachedFolderId = await createAppFolder();
       return cachedFolderId;
     })().finally(() => { folderPromise = null; });
@@ -125,31 +103,12 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     const safeName = `${Date.now()}-${crypto.randomUUID()}-${path.basename(originalName || "video.mp4")}`;
     const folderId = await resolveFolderId();
     const metadata = { name: safeName, parents: [folderId] };
-
-    const init = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,mimeType,parents", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Upload-Content-Type": file.mimetype || "video/mp4",
-        "X-Upload-Content-Length": String(stat.size)
-      },
-      body: JSON.stringify(metadata)
-    });
+    const init = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,mimeType,parents", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=UTF-8", "X-Upload-Content-Type": file.mimetype || "video/mp4", "X-Upload-Content-Length": String(stat.size) }, body: JSON.stringify(metadata) });
     const initPayload = await readGoogleJson(init);
     if (!init.ok) throw googleError("Google Drive upload init failed", init, initPayload);
     const location = init.headers.get("location");
     if (!location) throw new Error("Google Drive resumable upload URL was not returned.");
-
-    const up = await fetch(location, {
-      method: "PUT",
-      headers: {
-        "Content-Type": file.mimetype || "video/mp4",
-        "Content-Length": String(stat.size)
-      },
-      body: fs.createReadStream(file.path),
-      duplex: "half"
-    });
+    const up = await fetch(location, { method: "PUT", headers: { "Content-Type": file.mimetype || "video/mp4", "Content-Length": String(stat.size) }, body: fs.createReadStream(file.path), duplex: "half" });
     const json = await readGoogleJson(up);
     if (!up.ok || !json.id) throw googleError("Google Drive upload failed", up, json);
     try { fs.unlinkSync(file.path); } catch (_) {}
@@ -161,23 +120,31 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     const headers = { Authorization: `Bearer ${token}` };
     if (req.headers.range) headers.Range = req.headers.range;
     let r = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers });
-    if (r.status === 401) {
-      cachedToken = null; tokenExpiresAt = 0;
-      const retryToken = await accessToken(true);
-      headers.Authorization = `Bearer ${retryToken}`;
-      r = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers });
-    }
-    if (!r.ok && r.status !== 206) {
-      const t = await r.text().catch(() => "");
-      return res.status(r.status).send(`Drive media fetch failed: ${t.slice(0, 400)}`);
-    }
-    for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) {
-      const v = r.headers.get(h);
-      if (v) res.setHeader(h, v);
-    }
+    if (r.status === 401) { cachedToken = null; tokenExpiresAt = 0; const retryToken = await accessToken(true); headers.Authorization = `Bearer ${retryToken}`; r = await fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`, { headers }); }
+    if (!r.ok && r.status !== 206) { const t = await r.text().catch(() => ""); return res.status(r.status).send(`Drive media fetch failed: ${t.slice(0, 400)}`); }
+    for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) { const v = r.headers.get(h); if (v) res.setHeader(h, v); }
     res.status(r.status);
     if (!r.body) return res.end();
     Readable.fromWeb(r.body).pipe(res);
+  }
+
+  async function initDirectUpload({ originalName, mimeType, size }) {
+    const token = await accessToken();
+    const safeName = `${Date.now()}-${crypto.randomUUID()}-${path.basename(originalName || "video.mp4")}`;
+    const folderId = await resolveFolderId();
+    const metadata = { name: safeName, parents: [folderId] };
+    const init = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,mimeType,parents", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=UTF-8", "X-Upload-Content-Type": mimeType || "video/mp4", "X-Upload-Content-Length": String(size || 0) }, body: JSON.stringify(metadata) });
+    const initPayload = await readGoogleJson(init);
+    if (!init.ok) throw googleError("Google Drive direct upload init failed", init, initPayload);
+    const location = init.headers.get("location");
+    if (!location) throw new Error("Google Drive resumable upload URL was not returned.");
+    return { uploadUrl: location, folderId, safeName };
+  }
+
+  async function metaFetchUrl(fileId) {
+    if (!fileId) throw new Error("Google Drive file id is missing.");
+    const token = await accessToken();
+    return `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&access_token=${encodeURIComponent(token)}`;
   }
 
   async function selfTest() {
@@ -188,18 +155,11 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     const metadata = JSON.stringify({ name, parents: [folderId] });
     const content = `drive-test ${new Date().toISOString()}`;
     const body = Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metadata}\r\n--${boundary}\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--${boundary}--\r\n`);
-    const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,parents", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}`, "Content-Length": String(body.length) },
-      body
-    });
+    const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,parents", { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}`, "Content-Length": String(body.length) }, body });
     const j = await readGoogleJson(r);
     if (!r.ok || !j.id) throw googleError("Google Drive test upload failed", r, j);
     const del = await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(j.id)}`, { method: "DELETE" });
-    if (!del.ok && del.status !== 404) {
-      const dj = await readGoogleJson(del);
-      throw googleError("Google Drive test cleanup failed", del, dj);
-    }
+    if (!del.ok && del.status !== 404) { const dj = await readGoogleJson(del); throw googleError("Google Drive test cleanup failed", del, dj); }
     return { ok: true, folderId, uploadedAndDeleted: true };
   }
 
@@ -207,32 +167,20 @@ function createGoogleDriveStore({ getRefreshToken } = {}) {
     mode: "gdrive",
     get durable() { return Boolean(currentRefreshToken()); },
     publicBase: null,
-    async put(file, originalName, baseUrl) {
-      const fileId = await uploadResumable(file, originalName);
-      return { mediaUrl: `${baseUrl}/drive-media/${encodeURIComponent(fileId)}`, storageKey: fileId };
-    },
-    async remove(job) {
-      const fileId = job?.storageKey;
-      if (!fileId) return;
-      const r = await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`, { method: "DELETE" });
-      if (!r.ok && r.status !== 404) {
-        const j = await readGoogleJson(r);
-        throw googleError("Google Drive delete failed", r, j);
-      }
-    },
-    async stream(fileId, req, res) {
-      return streamFile(fileId, req, res);
+    async put(file, originalName, baseUrl) { const fileId = await uploadResumable(file, originalName); return { mediaUrl: `${baseUrl}/drive-media/${encodeURIComponent(fileId)}`, storageKey: fileId }; },
+    async remove(job) { const fileId = job?.storageKey; if (!fileId) return; const r = await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`, { method: "DELETE" }); if (!r.ok && r.status !== 404) { const j = await readGoogleJson(r); throw googleError("Google Drive delete failed", r, j); } },
+    async stream(fileId, req, res) { return streamFile(fileId, req, res); },
+    async initDirectUpload(meta) { return initDirectUpload(meta); },
+    async metaUrl(job) {
+      const fileId = job?.storageKey || (() => { try { const u = new URL(job?.mediaUrl || ""); const parts = u.pathname.split("/").filter(Boolean); return parts.at(-1) || null; } catch { return null; } })();
+      return metaFetchUrl(fileId);
     },
     async selfTest() { return selfTest(); },
-    async folderInfo() {
-      const id = await resolveFolderId();
-      return { folderId: id, configuredFolderId: configuredFolderId || null, usingConfiguredFolder: Boolean(configuredFolderId && id === configuredFolderId), folderName };
-    }
+    async folderInfo() { const id = await resolveFolderId(); return { folderId: id, configuredFolderId: configuredFolderId || null, usingConfiguredFolder: Boolean(configuredFolderId && id === configuredFolderId), folderName }; }
   };
 }
 
 export function createMediaStore({ mediaDir, persistentRoot, getDriveRefreshToken }) {
-  // Prefer Google Drive when explicitly configured. It needs no paid object-storage account.
   const drive = createGoogleDriveStore({ getRefreshToken: getDriveRefreshToken });
   if (drive) return drive;
 
@@ -245,53 +193,20 @@ export function createMediaStore({ mediaDir, persistentRoot, getDriveRefreshToke
   const configured = Boolean(endpoint && bucket && accessKeyId && secretAccessKey && publicBase);
 
   if (configured) {
-    const client = new S3Client({
-      endpoint,
-      region,
-      credentials: { accessKeyId, secretAccessKey },
-      forcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || "false").toLowerCase() === "true"
-    });
+    const client = new S3Client({ endpoint, region, credentials: { accessKeyId, secretAccessKey }, forcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || "false").toLowerCase() === "true" });
     return {
-      mode: "s3",
-      durable: true,
-      publicBase,
-      async put(file, originalName) {
-        const ext = path.extname(originalName) || ".mp4";
-        const key = `media/${new Date().toISOString().slice(0,10)}/${crypto.randomUUID()}${ext}`;
-        await client.send(new PutObjectCommand({
-          Bucket: bucket,
-          Key: key,
-          Body: fs.createReadStream(file.path),
-          ContentType: file.mimetype || "video/mp4",
-          CacheControl: "public, max-age=86400"
-        }));
-        try { fs.unlinkSync(file.path); } catch (_) {}
-        const encodedKey = key.split("/").map(encodeURIComponent).join("/");
-        return { mediaUrl: `${publicBase}/${encodedKey}`, storageKey: key };
-      },
-      async remove(job) {
-        if (!job?.storageKey) return;
-        await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: job.storageKey }));
-      }
+      mode: "s3", durable: true, publicBase,
+      async put(file, originalName) { const ext = path.extname(originalName) || ".mp4"; const key = `media/${new Date().toISOString().slice(0,10)}/${crypto.randomUUID()}${ext}`; await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: fs.createReadStream(file.path), ContentType: file.mimetype || "video/mp4", CacheControl: "public, max-age=86400" })); try { fs.unlinkSync(file.path); } catch (_) {} const encodedKey = key.split("/").map(encodeURIComponent).join("/"); return { mediaUrl: `${publicBase}/${encodedKey}`, storageKey: key }; },
+      async remove(job) { if (!job?.storageKey) return; await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: job.storageKey })); },
+      async metaUrl(job) { return job?.mediaUrl; }
     };
   }
 
   fs.mkdirSync(mediaDir, { recursive: true });
   return {
-    mode: persistentRoot ? "disk" : "local",
-    durable: Boolean(persistentRoot),
-    publicBase: null,
-    async put(file, originalName, baseUrl) {
-      const ext = path.extname(originalName) || ".mp4";
-      const finalName = `${file.filename}${ext}`;
-      fs.renameSync(file.path, path.join(mediaDir, finalName));
-      return { mediaUrl: `${baseUrl}/media/${encodeURIComponent(finalName)}`, storageKey: finalName };
-    },
-    async remove(job) {
-      const name = job?.storageKey || (() => { try { return path.basename(new URL(job.mediaUrl).pathname); } catch { return null; } })();
-      if (!name) return;
-      const p = path.join(mediaDir, decodeURIComponent(name));
-      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
-    }
+    mode: persistentRoot ? "disk" : "local", durable: Boolean(persistentRoot), publicBase: null,
+    async put(file, originalName, baseUrl) { const ext = path.extname(originalName) || ".mp4"; const finalName = `${file.filename}${ext}`; fs.renameSync(file.path, path.join(mediaDir, finalName)); return { mediaUrl: `${baseUrl}/media/${encodeURIComponent(finalName)}`, storageKey: finalName }; },
+    async remove(job) { const name = job?.storageKey || (() => { try { return path.basename(new URL(job.mediaUrl).pathname); } catch { return null; } })(); if (!name) return; const p = path.join(mediaDir, decodeURIComponent(name)); try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {} },
+    async metaUrl(job) { return job?.mediaUrl; }
   };
 }
