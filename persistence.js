@@ -28,8 +28,28 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jobs_state (
+      id TEXT PRIMARY KEY,
+      value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
-  async function ensureAndRestore(key, file) {
+  async function upsertJobRows(client, rows) {
+    for (let i = 0; i < rows.length; i += 200) {
+      const chunk = rows.slice(i, i + 200);
+      const params = [];
+      const values = chunk.map(([id, json], idx) => {
+        params.push(id, json);
+        const a = idx * 2 + 1, b = a + 1;
+        return `($${a},$${b}::jsonb,NOW())`;
+      }).join(",");
+      await client.query(`INSERT INTO jobs_state(id,value,updated_at) VALUES ${values} ON CONFLICT(id) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()`, params);
+    }
+  }
+
+  async function ensureAndRestoreSimple(key, file) {
     const remote = await pool.query(`SELECT value FROM app_state WHERE key=$1`, [key]);
     if (remote.rows.length) {
       fs.writeFileSync(file, JSON.stringify(remote.rows[0].value || [], null, 2));
@@ -44,12 +64,43 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
     `, [key, JSON.stringify(local)]);
   }
 
+  async function migrateAndRestoreJobs() {
+    const count = Number((await pool.query(`SELECT COUNT(*)::int AS n FROM jobs_state`)).rows[0]?.n || 0);
+    if (!count) {
+      let source = [];
+      const legacy = await pool.query(`SELECT value FROM app_state WHERE key='jobs'`);
+      if (legacy.rows.length && Array.isArray(legacy.rows[0].value)) source = legacy.rows[0].value;
+      else {
+        try { source = JSON.parse(fs.readFileSync(jobsFile, "utf8")); } catch (_) { source = []; }
+      }
+      if (source.length) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await upsertJobRows(client, source.filter(job=>job?.id).map(job => [String(job.id), JSON.stringify(job)]));
+          await client.query("COMMIT");
+        } catch (e) {
+          await client.query("ROLLBACK").catch(()=>{});
+          throw e;
+        } finally { client.release(); }
+      }
+      // Once migrated, stop rewriting the old giant jobs JSONB document.
+      await pool.query(`DELETE FROM app_state WHERE key='jobs'`).catch(()=>{});
+    }
+    const rows = await pool.query(`SELECT value FROM jobs_state ORDER BY COALESCE((value->>'createdAt')::timestamptz, NOW()) ASC`);
+    const jobs = rows.rows.map(r => r.value).filter(Boolean);
+    fs.writeFileSync(jobsFile, JSON.stringify(jobs, null, 2));
+    return jobs;
+  }
+
   fs.mkdirSync(dataDir, { recursive: true });
-  await ensureAndRestore("accounts", accountsFile);
-  await ensureAndRestore("jobs", jobsFile);
+  await ensureAndRestoreSimple("accounts", accountsFile);
+  const restoredJobs = await migrateAndRestoreJobs();
 
   let tail = Promise.resolve();
-  function persist(key, value) {
+  let lastJobsMap = new Map(restoredJobs.filter(j=>j?.id).map(j => [String(j.id), JSON.stringify(j)]));
+
+  function persistSimple(key, value) {
     const snapshot = JSON.stringify(value);
     tail = tail.then(() => pool.query(`
       INSERT INTO app_state(key,value,updated_at) VALUES($1,$2::jsonb,NOW())
@@ -58,12 +109,44 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
     return tail;
   }
 
+  function persistJobs(value) {
+    const rows = (Array.isArray(value) ? value : []).filter(j=>j?.id).map(j => [String(j.id), JSON.stringify(j)]);
+    tail = tail.then(async () => {
+      const next = new Map(rows);
+      const changed = rows.filter(([id, json]) => lastJobsMap.get(id) !== json);
+      const removed = [...lastJobsMap.keys()].filter(id => !next.has(id));
+      if (!changed.length && !removed.length) { lastJobsMap = next; return; }
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await upsertJobRows(client, changed);
+        if (removed.length) await client.query(`DELETE FROM jobs_state WHERE id = ANY($1::text[])`, [removed]);
+        await client.query("COMMIT");
+        lastJobsMap = next;
+      } catch (e) {
+        await client.query("ROLLBACK").catch(()=>{});
+        console.error("Persistent jobs delta write failed:", e.message);
+        throw e;
+      } finally { client.release(); }
+    }).catch((e) => console.error("Persistent state write failed:", e.message));
+    return tail;
+  }
+
+  function persist(key, value) {
+    return key === "jobs" ? persistJobs(value) : persistSimple(key, value);
+  }
+
   async function get(key) {
+    if (key === "jobs") {
+      const r = await pool.query(`SELECT value FROM jobs_state ORDER BY COALESCE((value->>'createdAt')::timestamptz, NOW()) ASC`);
+      return r.rows.map(x=>x.value);
+    }
     const r = await pool.query(`SELECT value FROM app_state WHERE key=$1`, [key]);
     return r.rows.length ? r.rows[0].value : null;
   }
 
   async function set(key, value) {
+    if (key === "jobs") { persistJobs(value); await tail; return true; }
     await pool.query(`
       INSERT INTO app_state(key,value,updated_at) VALUES($1,$2::jsonb,NOW())
       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
@@ -78,9 +161,7 @@ export async function createPersistence({ dataDir, accountsFile, jobsFile }) {
       if (!r.rows[0]?.ok) return false;
       try { await fn(); } finally { await client.query(`SELECT pg_advisory_unlock(140014001)`); }
       return true;
-    } finally {
-      client.release();
-    }
+    } finally { client.release(); }
   }
 
   return {

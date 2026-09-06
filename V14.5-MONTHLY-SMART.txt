@@ -1,0 +1,6 @@
+v14.5 Monthly Smart 24H
+
+- Preserves v14.4 durable Postgres + Google Drive + pause/resume/catch-up protection.
+- Stores Monthly Smart plan metadata on every scheduled job.
+- Adds GET /api/monthly-plans for plan-level progress summaries.
+- Compatible with explicit-time scheduling from PC v11.8 and Mobile v15.

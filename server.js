@@ -44,10 +44,20 @@ const jobsFile = path.join(dataDir, "jobs.json");
 if (!fs.existsSync(accountsFile)) fs.writeFileSync(accountsFile, "[]");
 if (!fs.existsSync(jobsFile)) fs.writeFileSync(jobsFile, "[]");
 
-const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
+const stateCache = new Map();
+const read = (f) => {
+  if (stateCache.has(f)) return stateCache.get(f);
+  const value = JSON.parse(fs.readFileSync(f, "utf8"));
+  stateCache.set(f, value);
+  return value;
+};
 let persistence = null;
 const write = (f, x) => {
-  fs.writeFileSync(f, JSON.stringify(x, null, 2));
+  stateCache.set(f, x);
+  // When Postgres is durable, the local JSON file is only a startup mirror and
+  // does not need to be rewritten on every scheduler action. This keeps very
+  // large monthly queues from causing huge ephemeral-disk writes.
+  if (!persistence?.durable) fs.writeFileSync(f, JSON.stringify(x, null, 2));
   if (persistence) {
     const key = f === accountsFile ? "accounts" : f === jobsFile ? "jobs" : null;
     if (key) return persistence.persist(key, x);
@@ -283,12 +293,12 @@ function requireSafeStorage(req, res, next) {
 }
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.3</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.4 Pause/Resume + Catch-up Protection Backend is Live</h1><p>Durable accounts/jobs + durable media + restart-safe scheduler. Includes global Pause/Resume and wake catch-up protection so overdue jobs are re-spaced instead of publishing in a burst.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.6</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.6 Monthly Smart + Pause/Resume Backend is Live</h1><p>Durable accounts/jobs + Google Drive media + restart-safe scheduler. Includes Monthly Smart 24H, global Pause/Resume, wake catch-up protection, and additive published/follower analytics.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
 });
 
 app.get("/api/health", (req, res) => {
   const status = storageStatus();
-  res.json({ ok: true, version: "14.4.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
+  res.json({ ok: true, version: "14.6.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
 });
 
 app.get("/api/drive-test", async (req, res) => {
@@ -444,6 +454,218 @@ app.post("/api/scheduler/resume", async (req, res) => {
 
 app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
 
+// Lightweight dashboard payload for very large monthly queues. Older clients
+// can keep using /api/jobs; v11.8/v15 use this endpoint so 20k+ jobs are not
+// downloaded every few seconds.
+app.get("/api/dashboard-state", (req, res) => {
+  const jobs = read(jobsFile);
+  const activeStatuses = new Set(["scheduled","processing","ready","publishing","retry_wait"]);
+  const counts = {
+    active: jobs.filter(j => activeStatuses.has(j.status)).length,
+    published: jobs.filter(j => j.status === "published").length,
+    failed: jobs.filter(j => j.status === "failed").length,
+    total: jobs.length
+  };
+  const queue = jobs.filter(j => j.status !== "published")
+    .sort((a,b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))
+    .slice(0, 600);
+  const published = jobs.filter(j => j.status === "published")
+    .sort((a,b) => new Date(b.publishedAt || b.scheduledAt || 0) - new Date(a.publishedAt || a.scheduledAt || 0))
+    .slice(0, 150);
+  res.json({ ok:true, counts, jobs:[...queue, ...published], queueReturned:queue.length, publishedReturned:published.length, truncated:jobs.length > queue.length + published.length });
+});
+
+
+function clientDayWindow(tzOffsetMinutes = 0, nowMs = Date.now()) {
+  const offset = Math.max(-14*60, Math.min(14*60, Number(tzOffsetMinutes || 0)));
+  const shifted = new Date(nowMs + offset * 60_000);
+  const y = shifted.getUTCFullYear(), m = shifted.getUTCMonth(), d = shifted.getUTCDate();
+  const start = Date.UTC(y, m, d) - offset * 60_000;
+  return { start, end: start + 86_400_000, offset };
+}
+function metricLatestNumber(insights, name) {
+  const metric = (insights?.data || []).find(x => x?.name === name);
+  const values = Array.isArray(metric?.values) ? metric.values : [];
+  for (let i = values.length - 1; i >= 0; i--) {
+    const n = Number(values[i]?.value);
+    if (Number.isFinite(n)) return { value: n, at: values[i]?.end_time || null, values };
+  }
+  const direct = Number(metric?.total_value?.value);
+  return Number.isFinite(direct) ? { value: direct, at: null, values: [] } : null;
+}
+function metricSeriesNumbers(insights, name) {
+  const metric = (insights?.data || []).find(x => x?.name === name);
+  return (Array.isArray(metric?.values) ? metric.values : [])
+    .map(v => ({ value: Number(v?.value), at: v?.end_time || null }))
+    .filter(v => Number.isFinite(v.value));
+}
+
+// Exact per-account published counts without making clients download the whole
+// monthly queue. Read-only/additive: this endpoint never edits scheduled jobs.
+app.get("/api/published-stats", (req, res) => {
+  const jobs = read(jobsFile);
+  const accounts = read(accountsFile);
+  const { start, end, offset } = clientDayWindow(req.query.tzOffsetMinutes);
+  const rows = accounts.map(account => {
+    const published = jobs.filter(j => j.accountId === account.id && j.status === "published");
+    const today = published.filter(j => {
+      const t = new Date(j.publishedAt || j.scheduledAt || 0).getTime();
+      return Number.isFinite(t) && t >= start && t < end;
+    });
+    const sorted = published.slice().sort((a,b)=>new Date(a.publishedAt||a.scheduledAt||0)-new Date(b.publishedAt||b.scheduledAt||0));
+    return {
+      accountId: account.id,
+      igUserId: account.igUserId,
+      label: account.label,
+      today: today.length,
+      total: published.length,
+      firstPublishedAt: sorted[0]?.publishedAt || sorted[0]?.scheduledAt || null,
+      lastPublishedAt: sorted.at(-1)?.publishedAt || sorted.at(-1)?.scheduledAt || null
+    };
+  });
+  res.json({ ok:true, tzOffsetMinutes: offset, accounts: rows, todayTotal: rows.reduce((n,r)=>n+r.today,0), totalPublished: rows.reduce((n,r)=>n+r.total,0) });
+});
+
+// Optional follower-growth analytics. This is deliberately isolated from the
+// scheduler. If Meta Insights permission is unavailable, the endpoint falls
+// back to a durable "first successful check" baseline rather than touching jobs.
+app.get("/api/account-analytics", async (req, res) => {
+  const accountId = String(req.query.accountId || "").trim();
+  const accounts = read(accountsFile);
+  const account = accounts.find(a => String(a.id) === accountId);
+  if (!account) return res.status(404).json({ error: "Account not found." });
+
+  const jobs = read(jobsFile);
+  const published = jobs.filter(j => j.accountId === account.id && j.status === "published");
+  const sorted = published.slice().sort((a,b)=>new Date(a.publishedAt||a.scheduledAt||0)-new Date(b.publishedAt||b.scheduledAt||0));
+  const firstPublishedAt = sorted[0]?.publishedAt || sorted[0]?.scheduledAt || null;
+  const { start: todayStart, end: todayEnd } = clientDayWindow(req.query.tzOffsetMinutes);
+  const todayPublished = published.filter(j => {
+    const t = new Date(j.publishedAt || j.scheduledAt || 0).getTime();
+    return Number.isFinite(t) && t >= todayStart && t < todayEnd;
+  }).length;
+
+  const token = decrypt(account.tokenEnc);
+  let profile = null, profileError = null;
+  try {
+    profile = await graph(`${account.igUserId}`, { fields: "username,followers_count,follows_count,media_count" }, token, "GET");
+  } catch (e) { profileError = e; }
+
+  let insights = null, insightsError = null;
+  const now = Date.now();
+  const earliestAllowed = now - 89 * 86_400_000;
+  const firstMs = firstPublishedAt ? new Date(firstPublishedAt).getTime() : now;
+  const sinceMs = Math.max(Number.isFinite(firstMs) ? firstMs : now, earliestAllowed);
+  try {
+    insights = await graph(`${account.igUserId}/insights`, {
+      metric: "follower_count,reach,profile_views",
+      period: "day",
+      since: Math.floor(sinceMs / 1000),
+      until: Math.floor(now / 1000)
+    }, token, "GET");
+  } catch (e) { insightsError = e; }
+
+  const followerSeries = metricSeriesNumbers(insights, "follower_count");
+  const followerLatestInsight = metricLatestNumber(insights, "follower_count");
+  const reachLatest = metricLatestNumber(insights, "reach");
+  const profileViewsLatest = metricLatestNumber(insights, "profile_views");
+
+  let currentFollowers = Number(profile?.followers_count);
+  if (!Number.isFinite(currentFollowers)) currentFollowers = followerLatestInsight?.value;
+  if (!Number.isFinite(currentFollowers)) currentFollowers = null;
+
+  let baselines = {};
+  try { baselines = (await persistence?.get?.("analytics_baselines")) || {}; } catch (_) {}
+  if (!baselines || typeof baselines !== "object" || Array.isArray(baselines)) baselines = {};
+  let baselineFollowers = null, baselineAt = null, baselineSource = null;
+
+  if (followerSeries.length) {
+    baselineFollowers = followerSeries[0].value;
+    baselineAt = followerSeries[0].at || new Date(sinceMs).toISOString();
+    baselineSource = "instagram_insights_history";
+  } else if (Number.isFinite(currentFollowers)) {
+    const saved = baselines[account.id];
+    if (saved && Number.isFinite(Number(saved.followers))) {
+      baselineFollowers = Number(saved.followers);
+      baselineAt = saved.at || null;
+      baselineSource = "durable_tracking_baseline";
+    } else {
+      baselineFollowers = currentFollowers;
+      baselineAt = new Date().toISOString();
+      baselineSource = "tracking_started_now";
+      baselines[account.id] = { followers: currentFollowers, at: baselineAt, igUserId: account.igUserId };
+      try { await persistence?.set?.("analytics_baselines", baselines); } catch (_) {}
+    }
+  }
+
+  const followersGain = Number.isFinite(currentFollowers) && Number.isFinite(baselineFollowers) ? currentFollowers - baselineFollowers : null;
+  const permissionNeeded = Boolean(insightsError) && /permission|insight|scope|access/i.test(String(insightsError.message || insightsError));
+  let note = "";
+  if (baselineSource === "instagram_insights_history") note = "Follower gain uses available Instagram Insights history (up to Meta's retained history window).";
+  else if (baselineSource === "durable_tracking_baseline") note = `Follower gain is tracked from ${baselineAt ? new Date(baselineAt).toLocaleDateString("en-US") : "the first successful check"}.`;
+  else if (baselineSource === "tracking_started_now") note = "Historical follower baseline was unavailable, so durable follower tracking starts from this check.";
+  if (permissionNeeded) note += `${note ? " " : ""}For historical reach/profile/follower insights, add instagram_business_manage_insights and reconnect/regenerate the Instagram token.`;
+  if (!currentFollowers && profileError) note += `${note ? " " : ""}${profileError.message}`;
+
+  res.json({
+    ok: true,
+    accountId: account.id,
+    label: account.label,
+    firstPublishedAt,
+    todayPublished,
+    totalPublished: published.length,
+    currentFollowers,
+    baselineFollowers,
+    baselineAt,
+    baselineSource,
+    followersGain,
+    currentMediaCount: Number.isFinite(Number(profile?.media_count)) ? Number(profile.media_count) : null,
+    reachToday: reachLatest?.value ?? null,
+    profileViewsToday: profileViewsLatest?.value ?? null,
+    insightsPermissionNeeded: permissionNeeded,
+    insightsError: insightsError ? String(insightsError.message || insightsError) : null,
+    note
+  });
+});
+
+// Summaries for long-running Monthly Smart 24H plans. The actual schedule is
+// still stored on each job, so the plan survives restarts with the same durable
+// Postgres persistence as the rest of the queue.
+app.get("/api/monthly-plans", (req, res) => {
+  const jobs = read(jobsFile).filter(j => j.planId && j.scheduleKind === "monthly_smart");
+  const groups = new Map();
+  for (const job of jobs) {
+    if (!groups.has(job.planId)) groups.set(job.planId, {
+      planId: job.planId,
+      startDate: job.planStartDate || null,
+      endDate: job.planEndDate || null,
+      dailyLimit: Number(job.planDailyLimit || 0),
+      accountCount: 0,
+      accounts: new Set(),
+      jobs: 0,
+      scheduled: 0,
+      published: 0,
+      failed: 0,
+      firstScheduledAt: null,
+      lastScheduledAt: null,
+      createdAt: job.createdAt || null
+    });
+    const g = groups.get(job.planId);
+    g.jobs++;
+    g.accounts.add(job.accountId);
+    if (job.status === "published") g.published++;
+    else if (job.status === "failed") g.failed++;
+    else if (["scheduled","processing","ready","publishing","retry_wait"].includes(job.status)) g.scheduled++;
+    const t = new Date(job.scheduledAt).getTime();
+    if (Number.isFinite(t)) {
+      if (!g.firstScheduledAt || t < new Date(g.firstScheduledAt).getTime()) g.firstScheduledAt = job.scheduledAt;
+      if (!g.lastScheduledAt || t > new Date(g.lastScheduledAt).getTime()) g.lastScheduledAt = job.scheduledAt;
+    }
+  }
+  const out = [...groups.values()].map(g => ({...g, accountCount: g.accounts.size, accounts: undefined})).sort((a,b)=>new Date(b.createdAt||0)-new Date(a.createdAt||0));
+  res.json({ ok: true, plans: out });
+});
+
 // Manually remove a queued job. We intentionally block jobs that are actively
 // processing/publishing or already published so a user cannot interrupt a Meta
 // API transaction halfway through.
@@ -530,6 +752,21 @@ app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async 
       scheduleTimes = Array.from({ length: totalJobs }, (_, i) => fixed + i * gap);
     }
 
+    // Idempotency for resumable/background uploads: if a client retries a chunk
+    // after the backend already created every matching job, do not duplicate it.
+    const jobs = read(jobsFile);
+    const scheduleIso = scheduleTimes.map(t => new Date(t).toISOString());
+    const existingKeys = new Set(jobs.filter(j => j.batchId === (cfg.batchId || "")).map(j => `${j.accountId}|${j.fileName}|${j.scheduledAt}`));
+    if (cfg.batchId) {
+      const expected = [];
+      let ei = 0;
+      for (const file of files) for (const account of selected) expected.push(`${account.id}|${file.originalname}|${scheduleIso[ei++]}`);
+      if (expected.length && expected.every(k => existingKeys.has(k))) {
+        for (const file of files) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+        return res.json({ ok:true, created:0, deduped:expected.length, videos:files.length, accounts:selected.length, firstScheduledAt:scheduleIso[0], lastScheduledAt:scheduleIso[scheduleIso.length-1] });
+      }
+    }
+
     const base = publicBaseUrl(req);
     const storedFiles = [];
     for (const file of files) {
@@ -537,15 +774,17 @@ app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async 
       storedFiles.push({ originalname: file.originalname, mediaUrl: stored.mediaUrl, storageKey: stored.storageKey || null });
     }
 
-    const jobs = read(jobsFile);
     const batchId = cfg.batchId || newId();
-    let index = 0;
+    let index = 0, createdCount = 0;
     const perVideoCaptions = Array.isArray(cfg.captions) ? cfg.captions.map((v) => String(v ?? "").slice(0, 2200)) : [];
     let fileIndex = 0;
     // Every selected video is scheduled to every selected account.
     for (const file of storedFiles) {
       const fileCaption = (perVideoCaptions[fileIndex] !== undefined ? perVideoCaptions[fileIndex] : String(cfg.caption || "")).slice(0, 2200);
       for (const account of selected) {
+        const scheduledAt = scheduleIso[index++];
+        const dedupeKey = `${account.id}|${file.originalname}|${scheduledAt}`;
+        if (cfg.batchId && existingKeys.has(dedupeKey)) continue;
         jobs.push({
           id: newId(),
           batchId,
@@ -556,7 +795,7 @@ app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async 
           mediaUrl: file.mediaUrl,
           storageKey: file.storageKey || null,
           caption: fileCaption,
-          scheduledAt: new Date(scheduleTimes[index++]).toISOString(),
+          scheduledAt,
           status: "scheduled",
           createdAt: new Date().toISOString(),
           error: null,
@@ -568,15 +807,21 @@ app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async 
           retryCount: 0,
           nextAttemptAt: null,
           lastAttemptAt: null,
-          lastErrorType: null
+          lastErrorType: null,
+          scheduleKind: String(cfg.scheduleKind || "standard"),
+          planId: cfg.planId ? String(cfg.planId) : null,
+          planStartDate: cfg.monthlyPlan?.startDate ? String(cfg.monthlyPlan.startDate) : null,
+          planEndDate: cfg.monthlyPlan?.endDate ? String(cfg.monthlyPlan.endDate) : null,
+          planDailyLimit: cfg.monthlyPlan?.dailyLimit ? Number(cfg.monthlyPlan.dailyLimit) : null
         });
+        createdCount++;
       }
       fileIndex++;
     }
 
     await write(jobsFile, jobs);
     await persistence?.flush?.();
-    res.json({ ok: true, created: totalJobs, videos: files.length, accounts: selected.length, firstScheduledAt: new Date(scheduleTimes[0]).toISOString(), lastScheduledAt: new Date(scheduleTimes[scheduleTimes.length - 1]).toISOString() });
+    res.json({ ok: true, created: createdCount, deduped: totalJobs-createdCount, videos: files.length, accounts: selected.length, firstScheduledAt: scheduleIso[0], lastScheduledAt: scheduleIso[scheduleIso.length - 1] });
   } catch (error) {
     for (const file of req.files || []) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
     res.status(400).json({ error: error.message });
@@ -827,4 +1072,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.4 durable backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.6 monthly-smart backend running on port ${PORT}`));

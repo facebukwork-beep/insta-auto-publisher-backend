@@ -1,0 +1,6 @@
+v14.6 additive analytics only
+- scheduler logic unchanged from v14.5
+- exact per-account published Today/Total endpoint
+- optional follower growth/current media count/reach/profile views
+- durable follower baseline fallback
+- no scheduled jobs are deleted, shifted, or rewritten by these analytics routes
