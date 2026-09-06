@@ -54,9 +54,6 @@ const read = (f) => {
 let persistence = null;
 const write = (f, x) => {
   stateCache.set(f, x);
-  // When Postgres is durable, the local JSON file is only a startup mirror and
-  // does not need to be rewritten on every scheduler action. This keeps very
-  // large monthly queues from causing huge ephemeral-disk writes.
   if (!persistence?.durable) fs.writeFileSync(f, JSON.stringify(x, null, 2));
   if (persistence) {
     const key = f === accountsFile ? "accounts" : f === jobsFile ? "jobs" : null;
@@ -221,659 +218,543 @@ app.get("/api/google-drive/connect", (req, res) => {
   if (!GDRIVE_CLIENT_ID || !GDRIVE_CLIENT_SECRET) {
     return res.status(409).send("GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET must be configured first.");
   }
-  const redirectUri = driveOAuthRedirectUri(req);
-  const params = new URLSearchParams({
-    client_id: GDRIVE_CLIENT_ID,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: "https://www.googleapis.com/auth/drive.file",
-    access_type: "offline",
-    prompt: "consent",
-    include_granted_scopes: "true",
-    state: makeDriveOAuthState()
-  });
-  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+  const u = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  u.searchParams.set("client_id", GDRIVE_CLIENT_ID);
+  u.searchParams.set("redirect_uri", driveOAuthRedirectUri(req));
+  u.searchParams.set("response_type", "code");
+  u.searchParams.set("scope", "https://www.googleapis.com/auth/drive.file");
+  u.searchParams.set("access_type", "offline");
+  u.searchParams.set("prompt", "consent");
+  u.searchParams.set("include_granted_scopes", "true");
+  u.searchParams.set("state", makeDriveOAuthState());
+  res.redirect(u.toString());
 });
 
 app.get("/api/google-drive/oauth/callback", async (req, res) => {
-  const { code, state, error } = req.query || {};
-  if (error) return res.status(400).send(`Google authorization failed: ${String(error)}`);
-  if (!code || !verifyDriveOAuthState(state)) return res.status(400).send("Invalid or expired Google OAuth callback state.");
   try {
-    const redirectUri = driveOAuthRedirectUri(req);
+    if (!verifyDriveOAuthState(req.query.state)) return res.status(400).send("Invalid or expired OAuth state. Start again from /api/google-drive/connect.");
+    if (!req.query.code) return res.status(400).send(`Google authorization failed: ${req.query.error || "missing authorization code"}`);
     const body = new URLSearchParams({
-      code: String(code),
       client_id: GDRIVE_CLIENT_ID,
       client_secret: GDRIVE_CLIENT_SECRET,
-      redirect_uri: redirectUri,
-      grant_type: "authorization_code"
+      code: String(req.query.code),
+      grant_type: "authorization_code",
+      redirect_uri: driveOAuthRedirectUri(req)
     });
-    const r = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body
-    });
-    const payload = await r.json().catch(() => ({}));
-    if (!r.ok || !payload.refresh_token) {
-      const detail = payload?.error_description || payload?.error || `HTTP ${r.status}`;
-      throw new Error(`Google token exchange failed: ${detail}`);
-    }
-    await saveDriveRefreshToken(payload.refresh_token);
-    res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><body style="font-family:Arial;background:#08101d;color:#fff;padding:32px"><h1>✅ Google Drive connected</h1><p>The refresh token is now encrypted and saved in your durable Postgres state. You no longer need OAuth Playground or GDRIVE_REFRESH_TOKEN for this connection.</p><p><a style="color:#8ab4ff" href="/api/drive-test">Run Drive test</a></p></body>`);
+    const r = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body });
+    const text = await r.text();
+    let j = {};
+    try { j = text ? JSON.parse(text) : {}; } catch { j = { raw: text }; }
+    if (!r.ok) return res.status(400).send(`Google OAuth token exchange failed (${r.status}): ${j.error_description || j.error || j.raw || "unknown error"}`);
+    if (!j.refresh_token && !driveRefreshToken) return res.status(400).send("Google did not return a refresh token. Revoke the app in your Google Account and connect again.");
+    if (j.refresh_token) await saveDriveRefreshToken(j.refresh_token);
+    res.type("html").send(`<!doctype html><meta name="viewport" content="width=device-width"><title>Drive connected</title><body style="font:16px system-ui;background:#08111f;color:#fff;padding:28px"><h1>✅ Google Drive connected</h1><p>The refresh token is now encrypted and saved in your durable Postgres state. You no longer need OAuth Playground or GDRIVE_REFRESH_TOKEN for this connection.</p><p><a style="color:#8ab4ff" href="/api/drive-test">Run Drive test</a></p></body>`);
   } catch (e) {
-    res.status(502).type("text").send(String(e?.message || e));
+    res.status(500).send(`Drive OAuth callback failed: ${e.message}`);
   }
 });
 
-app.get("/drive-media/:fileId", async (req, res) => {
-  if (!mediaStore?.stream) return res.status(404).send("Google Drive media storage is not configured.");
-  try { await mediaStore.stream(req.params.fileId, req, res); }
-  catch (e) { if (!res.headersSent) res.status(502).send(`Drive media proxy error: ${e.message}`); else res.end(); }
+app.get("/api/google-drive/status", (req, res) => {
+  res.json({ ok: true, configured: Boolean(GDRIVE_CLIENT_ID && GDRIVE_CLIENT_SECRET), connected: Boolean(driveRefreshToken), durableToken: Boolean(persistence?.durable), connectUrl: `${publicBaseUrl(req)}/api/google-drive/connect` });
 });
-
-function storageStatus() {
-  const statePersistent = Boolean(persistentRoot) || Boolean(persistence?.durable);
-  const mediaPersistent = Boolean(mediaStore?.durable);
-  const restartSafe = statePersistent && mediaPersistent;
-  const reasons = [];
-  if (!statePersistent) reasons.push("State is local/ephemeral. Configure DATABASE_URL or PERSISTENT_ROOT.");
-  if (!mediaPersistent) reasons.push("Media is local/ephemeral. Configure Google Drive, S3/R2 storage, or PERSISTENT_ROOT.");
-  return { statePersistent, mediaPersistent, restartSafe, reasons };
-}
-
-function requireSafeStorage(req, res, next) {
-  const status = storageStatus();
-  if (REQUIRE_RESTART_SAFE_STORAGE && !status.restartSafe) {
-    return res.status(503).json({
-      error: "Restart-safe storage is not configured. Bulk scheduling is blocked to prevent queued videos from disappearing after a restart/redeploy.",
-      storage: status
-    });
-  }
-  next();
-}
 
 app.get("/", (req, res) => {
-  res.type("html").send(`<html><head><title>Insta Auto Publisher v14.6</title></head><body style="font-family:Arial;background:#0b1018;color:white;padding:40px"><h1>✅ Insta Auto Publisher v14.6 Monthly Smart + Pause/Resume Backend is Live</h1><p>Durable accounts/jobs + Google Drive media + restart-safe scheduler. Includes Monthly Smart 24H, global Pause/Resume, wake catch-up protection, and additive published/follower analytics.</p><p>Health: <code>/api/health</code></p><p>Graph API: <b>${GRAPH}</b></p></body></html>`);
+  res.send("✅ Insta Auto Publisher Backend is Live");
 });
 
 app.get("/api/health", (req, res) => {
-  const status = storageStatus();
-  res.json({ ok: true, version: "14.6.0", graphApiVersion: GRAPH, publicBaseUrl: publicBaseUrl(req), persistence: persistence?.mode || "local", mediaStorage: mediaStore?.mode || "local", persistentRoot: persistentRoot || null, ...status, requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE, prepareAheadMinutes: PREPARE_AHEAD_MS / 60_000, metaMinRequestIntervalSeconds: META_MIN_REQUEST_INTERVAL_MS / 1000, rateLimitBackoffMinutes: RATE_LIMIT_BACKOFF_MS / 60_000 });
-});
-
-app.get("/api/drive-test", async (req, res) => {
-  if (mediaStore?.mode !== "gdrive" || typeof mediaStore.selfTest !== "function") return res.status(409).json({ ok:false, error:"Google Drive media storage is not configured." });
-  try {
-    const result = await mediaStore.selfTest();
-    const folder = typeof mediaStore.folderInfo === "function" ? await mediaStore.folderInfo() : {};
-    res.json({ ok:true, ...result, ...folder });
-  } catch (e) {
-    res.status(502).json({ ok:false, error:String(e?.message || e) });
-  }
+  res.json({ ok: true, service: "insta-auto-publisher", version: "14.8.0", graphApi: GRAPH, storage: mediaStore.describe() });
 });
 
 app.get("/api/storage-status", (req, res) => {
-  const status = storageStatus();
+  const media = mediaStore.describe();
+  const statePersistent = Boolean(persistence?.durable || persistentRoot);
+  const mediaPersistent = Boolean(media.persistent || persistentRoot);
+  const restartSafe = statePersistent && mediaPersistent;
+  const reasons = [];
+  if (!statePersistent) reasons.push("State is local/ephemeral. Configure DATABASE_URL or PERSISTENT_ROOT.");
+  if (!mediaPersistent) reasons.push("Media is local/ephemeral. Configure S3/R2 storage or PERSISTENT_ROOT.");
   res.json({
     ok: true,
-    state: persistence?.mode || "local",
-    media: mediaStore?.mode || "local",
+    state: persistence?.describe?.() || (persistentRoot ? "disk" : "local"),
+    media: media.type,
     persistentRoot: persistentRoot || null,
-    ...status,
-    safeToSchedule: !REQUIRE_RESTART_SAFE_STORAGE || status.restartSafe,
+    statePersistent,
+    mediaPersistent,
+    restartSafe,
+    reasons,
+    safeToSchedule: restartSafe || !REQUIRE_RESTART_SAFE_STORAGE,
     requireRestartSafeStorage: REQUIRE_RESTART_SAFE_STORAGE,
-    exactTimingWarning: !process.env.RENDER_INSTANCE_ID ? null : "A sleeping web service can still delay exact-time publishing. Durable storage prevents data loss, not service sleep."
+    exactTimingWarning: "A sleeping web service can still delay exact-time publishing. Durable storage prevents data loss, not service sleep."
   });
 });
 
-app.get("/api/accounts", (req, res) => res.json(read(accountsFile).map(({ tokenEnc, ...account }) => account)));
+app.get("/api/accounts", (req, res) => {
+  res.json(read(accountsFile).map(a => ({ id: a.id, igUserId: a.igUserId, label: a.label, username: a.username || null, createdAt: a.createdAt })));
+});
 
-function makeBackupBlob(item) {
-  return encrypt(JSON.stringify({ v: 2, label: item.label, igUserId: item.igUserId, tokenEnc: item.tokenEnc }));
-}
-
-// v11.2 recovery pack: lets the extension continuously mirror encrypted
-// account recovery blobs into chrome.storage.sync. No plaintext access token is
-// returned. This endpoint is especially useful before a Render redeploy/reset.
-app.get("/api/accounts/recovery-pack", (req, res) => {
-  const accounts = read(accountsFile);
+app.get("/api/accounts/recovery-export", (req, res) => {
   res.json({
     ok: true,
-    count: accounts.length,
-    backups: accounts.map((item) => ({
-      igUserId: String(item.igUserId),
-      label: item.label,
-      backupBlob: makeBackupBlob(item)
-    }))
+    exportedAt: new Date().toISOString(),
+    accounts: read(accountsFile).map(a => ({ id: a.id, igUserId: a.igUserId, label: a.label, username: a.username || null, createdAt: a.createdAt, tokenEnc: a.tokenEnc }))
   });
 });
 
-app.post("/api/accounts/restore", async (req, res) => {
-  const blobs = Array.isArray(req.body?.backups) ? req.body.backups : [];
-  if (!blobs.length) return res.json({ ok: true, restored: 0 });
-  const accounts = read(accountsFile);
-  let restored = 0;
-  for (const blob of blobs.slice(0, 30)) {
-    try {
-      const data = JSON.parse(decrypt(String(blob)));
-      if (!data?.igUserId || !data?.label || !data?.tokenEnc) continue;
-      const ig = String(data.igUserId).trim();
-      if (accounts.some(a => String(a.igUserId).trim() === ig)) continue;
-      // Verify nested encrypted token is still decryptable with the current APP_SECRET_KEY.
-      decrypt(data.tokenEnc);
-      accounts.push({ id: newId(), label: String(data.label).replace(/^@/, "").trim(), igUserId: ig, tokenEnc: data.tokenEnc, createdAt: new Date().toISOString(), restoredAt: new Date().toISOString() });
+app.post("/api/accounts/recovery-import", async (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
+    const current = read(accountsFile);
+    let restored = 0;
+    for (const src of incoming) {
+      if (!src?.igUserId || !src?.tokenEnc || !String(src.tokenEnc).includes(".")) continue;
+      let valid = false;
+      try { decrypt(src.tokenEnc); valid = true; } catch (_) {}
+      if (!valid) continue;
+      const duplicate = current.find(a => a.igUserId === String(src.igUserId).trim() || (src.id && a.id === src.id));
+      if (duplicate) {
+        duplicate.label = String(src.label || duplicate.label || src.igUserId).trim();
+        duplicate.username = String(src.username || duplicate.username || "").trim() || null;
+        duplicate.tokenEnc = src.tokenEnc;
+      } else {
+        current.push({ id: src.id || newId(), igUserId: String(src.igUserId).trim(), label: String(src.label || src.igUserId).trim(), username: String(src.username || "").trim() || null, tokenEnc: src.tokenEnc, createdAt: src.createdAt || new Date().toISOString() });
+      }
       restored++;
-    } catch (_) {}
-  }
-  if (restored) { await write(accountsFile, accounts); await persistence?.flush?.(); }
-  res.json({ ok: true, restored });
+    }
+    await write(accountsFile, current);
+    await persistence?.flush?.();
+    res.json({ ok: true, restored, accounts: current.map(a => ({ id:a.id, igUserId:a.igUserId, label:a.label, username:a.username||null, createdAt:a.createdAt })) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 app.post("/api/accounts", async (req, res) => {
-  const { label, igUserId, accessToken } = req.body || {};
-  if (!label || !igUserId || !accessToken) return res.status(400).json({ error: "label, igUserId and accessToken are required" });
+  const { igUserId, label, accessToken } = req.body || {};
+  if (!igUserId || !accessToken) return res.status(400).json({ error: "igUserId and accessToken are required." });
   const accounts = read(accountsFile);
-  const normalizedIgUserId = String(igUserId).trim();
-  if (accounts.some((a) => String(a.igUserId).trim() === normalizedIgUserId)) return res.status(409).json({ error: "This Instagram account is already connected." });
-  const item = { id: newId(), label: String(label).replace(/^@/, "").trim(), igUserId: normalizedIgUserId, tokenEnc: encrypt(String(accessToken).trim()), createdAt: new Date().toISOString() };
-  accounts.push(item); await write(accountsFile, accounts);
+  const cleanId = String(igUserId).trim();
+  const existing = accounts.find(a => a.igUserId === cleanId);
+  if (existing) {
+    existing.label = String(label || existing.label || cleanId).trim();
+    existing.tokenEnc = encrypt(String(accessToken).trim());
+    existing.updatedAt = new Date().toISOString();
+    await write(accountsFile, accounts);
+    await persistence?.flush?.();
+    return res.json({ id: existing.id, igUserId: existing.igUserId, label: existing.label, createdAt: existing.createdAt, updated: true });
+  }
+  if (accounts.length >= 15) return res.status(400).json({ error: "Maximum 15 accounts are supported." });
+  const account = { id: newId(), igUserId: cleanId, label: String(label || cleanId).trim(), tokenEnc: encrypt(String(accessToken).trim()), createdAt: new Date().toISOString() };
+  accounts.push(account);
+  await write(accountsFile, accounts);
   await persistence?.flush?.();
-  res.json({ id: item.id, label: item.label, igUserId: item.igUserId, backupBlob: makeBackupBlob(item) });
+  res.json({ id: account.id, igUserId: account.igUserId, label: account.label, createdAt: account.createdAt });
 });
 
 app.delete("/api/accounts/:id", async (req, res) => {
-  const accounts = read(accountsFile);
-  const account = accounts.find((a) => a.id === req.params.id);
-  if (!account) return res.status(404).json({ error: "Account not found." });
-  const jobs = read(jobsFile);
-  const active = jobs.some((j) => j.accountId === account.id && ["scheduled", "processing", "ready", "publishing", "retry_wait"].includes(j.status));
-  if (active) return res.status(409).json({ error: "Finish this account's active jobs before removing it." });
-  await write(accountsFile, accounts.filter((a) => a.id !== account.id));
+  let accounts = read(accountsFile);
+  const before = accounts.length;
+  accounts = accounts.filter(a => a.id !== req.params.id);
+  if (accounts.length === before) return res.status(404).json({ error: "Account not found." });
+  await write(accountsFile, accounts);
   await persistence?.flush?.();
-  res.json({ ok: true, removedId: account.id });
+  res.json({ ok: true });
 });
 
-app.get("/api/scheduler/status", (req, res) => {
+function jobPublic(j) {
+  return {
+    id: j.id, accountId: j.accountId, accountLabel: j.accountLabel, videoName: j.videoName,
+    caption: j.caption || "", scheduledAt: j.scheduledAt, status: j.status, error: j.error || null,
+    permalink: j.permalink || null, publishedAt: j.publishedAt || null,
+    retryCount: Number(j.retryCount || 0), nextAttemptAt: j.nextAttemptAt || null,
+    lastErrorType: j.lastErrorType || null, publishedMediaId: j.publishedMediaId || null,
+    createdAt: j.createdAt || null, preparedAt: j.preparedAt || null,
+    batchId: j.batchId || null, sourceUploadId: j.sourceUploadId || null,
+    scheduleMode: j.scheduleMode || null, monthlyDay: j.monthlyDay || null,
+    monthlyDayIndex: Number.isFinite(Number(j.monthlyDayIndex)) ? Number(j.monthlyDayIndex) : null,
+    catchupReason: j.catchupReason || null, catchupRebasedAt: j.catchupRebasedAt || null
+  };
+}
+
+app.get("/api/jobs", (req, res) => {
+  res.json(read(jobsFile).slice().sort((a,b) => new Date(a.scheduledAt) - new Date(b.scheduledAt)).map(jobPublic));
+});
+
+app.get("/api/jobs/published", (req, res) => {
+  res.json(read(jobsFile).filter(j => j.status === "published").slice().sort((a,b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0)).map(jobPublic));
+});
+
+function parseTzOffsetMinutes(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && Math.abs(n) <= 14 * 60 ? Math.trunc(n) : 330;
+}
+function shiftedDateKey(value, offsetMinutes) {
+  const t = new Date(value).getTime();
+  if (!Number.isFinite(t)) return null;
+  return new Date(t + offsetMinutes * 60_000).toISOString().slice(0, 10);
+}
+
+app.get("/api/published-stats", (req, res) => {
+  try {
+    const tzOffsetMinutes = parseTzOffsetMinutes(req.query.tzOffsetMinutes);
+    const todayKey = shiftedDateKey(Date.now(), tzOffsetMinutes);
+    const accounts = read(accountsFile);
+    const published = read(jobsFile).filter(j => j.status === "published");
+    const rows = accounts.map(a => {
+      const own = published.filter(j => j.accountId === a.id);
+      const dated = own.filter(j => j.publishedAt);
+      const firstPublishedAt = dated.length ? dated.reduce((m,j)=> !m || new Date(j.publishedAt)<new Date(m) ? j.publishedAt : m, null) : null;
+      const lastPublishedAt = dated.length ? dated.reduce((m,j)=> !m || new Date(j.publishedAt)>new Date(m) ? j.publishedAt : m, null) : null;
+      return {
+        accountId: a.id, igUserId: a.igUserId, label: a.label,
+        today: dated.filter(j => shiftedDateKey(j.publishedAt, tzOffsetMinutes) === todayKey).length,
+        total: own.length, firstPublishedAt, lastPublishedAt
+      };
+    });
+    res.json({ ok:true, tzOffsetMinutes, accounts: rows, todayTotal: rows.reduce((s,r)=>s+r.today,0), totalPublished: rows.reduce((s,r)=>s+r.total,0) });
+  } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+async function instagramAccountProfile(account) {
+  const token = decrypt(account.tokenEnc);
+  return graph(`${account.igUserId}`, { fields: "username,followers_count,media_count" }, token, "GET");
+}
+async function instagramDailyInsight(account, metric, sinceSec, untilSec) {
+  const token = decrypt(account.tokenEnc);
+  try {
+    const j = await graph(`${account.igUserId}/insights`, { metric, period:"day", since: sinceSec, until: untilSec }, token, "GET");
+    return j?.data?.[0]?.values || [];
+  } catch (e) {
+    return { __error: e.message };
+  }
+}
+function normalizeFollowerHistoryValues(values) {
+  if (!Array.isArray(values)) return [];
+  return values.map(v => ({ end_time:v?.end_time || null, value:Number(v?.value) })).filter(v => v.end_time && Number.isFinite(v.value));
+}
+function mostRecentAbsoluteFollowerValue(values, beforeIso) {
+  const before = beforeIso ? new Date(beforeIso).getTime() : Date.now();
+  const clean = normalizeFollowerHistoryValues(values).filter(v => new Date(v.end_time).getTime() <= before).sort((a,b)=>new Date(b.end_time)-new Date(a.end_time));
+  return clean[0] || null;
+}
+function sumInsightValues(values) {
+  if (!Array.isArray(values)) return null;
+  const nums = values.map(v=>Number(v?.value)).filter(Number.isFinite);
+  return nums.length ? nums.reduce((a,b)=>a+b,0) : null;
+}
+async function getAnalyticsBaselines() {
+  try { return (await persistence?.get?.("analytics_baselines")) || {}; } catch (_) { return {}; }
+}
+async function saveAnalyticsBaselines(x) {
+  if (persistence?.set) await persistence.set("analytics_baselines", x);
+}
+function validAbsoluteFollowerBaseline(x) {
+  return Number.isFinite(Number(x)) && Number(x) > 0;
+}
+
+app.get("/api/account-analytics", async (req, res) => {
+  try {
+    const accountId = String(req.query.accountId || "").trim();
+    const account = read(accountsFile).find(a=>a.id===accountId);
+    if (!account) return res.status(404).json({ error:"Account not found." });
+    const tzOffsetMinutes = parseTzOffsetMinutes(req.query.tzOffsetMinutes);
+    const published = read(jobsFile).filter(j=>j.status==="published" && j.accountId===account.id);
+    const dated = published.filter(j=>j.publishedAt);
+    const firstPublishedAt = dated.length ? dated.reduce((m,j)=>!m||new Date(j.publishedAt)<new Date(m)?j.publishedAt:m,null) : null;
+    const todayKey = shiftedDateKey(Date.now(), tzOffsetMinutes);
+    const todayPublished = dated.filter(j=>shiftedDateKey(j.publishedAt,tzOffsetMinutes)===todayKey).length;
+    const profile = await instagramAccountProfile(account);
+    const currentFollowers = Number(profile?.followers_count);
+    const currentMediaCount = Number(profile?.media_count);
+    const nowSec = Math.floor(Date.now()/1000);
+    const historyStartSec = Math.floor((Date.now()-29*86400_000)/1000);
+    const localNow = Date.now()+tzOffsetMinutes*60_000;
+    const dayStartShifted = new Date(new Date(localNow).toISOString().slice(0,10)+"T00:00:00.000Z").getTime();
+    const todayStartSec = Math.floor((dayStartShifted-tzOffsetMinutes*60_000)/1000);
+    const [reachValues, profileViewValues] = await Promise.all([
+      instagramDailyInsight(account,"reach",todayStartSec,nowSec),
+      instagramDailyInsight(account,"profile_views",todayStartSec,nowSec)
+    ]);
+    let insightsError = null;
+    for (const x of [reachValues,profileViewValues]) if (x && !Array.isArray(x) && x.__error) insightsError = insightsError || x.__error;
+    const baselines = await getAnalyticsBaselines();
+    const previous = baselines[account.id] || null;
+    let baselineFollowers = previous && validAbsoluteFollowerBaseline(previous.followers) ? Number(previous.followers) : null;
+    let baselineAt = previous?.baselineAt || null;
+    let baselineSource = previous?.source || null;
+    if (!validAbsoluteFollowerBaseline(baselineFollowers)) {
+      baselineFollowers = Number.isFinite(currentFollowers) && currentFollowers >= 0 ? currentFollowers : null;
+      baselineAt = new Date().toISOString();
+      baselineSource = "tracking_started_v14_7";
+      if (validAbsoluteFollowerBaseline(baselineFollowers)) {
+        baselines[account.id] = { followers: baselineFollowers, baselineAt, source: baselineSource, label: account.label };
+        await saveAnalyticsBaselines(baselines);
+      }
+    }
+    const followersGain = validAbsoluteFollowerBaseline(baselineFollowers) && Number.isFinite(currentFollowers) ? currentFollowers - Number(baselineFollowers) : null;
+    res.json({
+      ok:true, accountId:account.id, label:account.label, firstPublishedAt, todayPublished, totalPublished:published.length,
+      currentFollowers:Number.isFinite(currentFollowers)?currentFollowers:null,
+      baselineFollowers:validAbsoluteFollowerBaseline(baselineFollowers)?Number(baselineFollowers):null,
+      baselineAt, baselineSource, followersGain,
+      currentMediaCount:Number.isFinite(currentMediaCount)?currentMediaCount:null,
+      reachToday:sumInsightValues(reachValues), profileViewsToday:sumInsightValues(profileViewValues),
+      insightsPermissionNeeded:Boolean(insightsError && /permission|insufficient|unsupported|access/i.test(insightsError)), insightsError,
+      note:"Accurate follower tracking starts from this snapshot because an absolute follower baseline was not stored before v14.7."
+    });
+  } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+app.post("/api/account-analytics/reset-baseline", async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId || "").trim();
+    const account = read(accountsFile).find(a=>a.id===accountId);
+    if (!account) return res.status(404).json({ error:"Account not found." });
+    const profile = await instagramAccountProfile(account);
+    const currentFollowers = Number(profile?.followers_count);
+    if (!validAbsoluteFollowerBaseline(currentFollowers)) return res.status(409).json({ error:"Instagram did not return a valid current follower count." });
+    const baselines = await getAnalyticsBaselines();
+    baselines[account.id] = { followers:currentFollowers, baselineAt:new Date().toISOString(), source:"manual_reset", label:account.label };
+    await saveAnalyticsBaselines(baselines);
+    res.json({ ok:true, accountId:account.id, baselineFollowers:currentFollowers, baselineAt:baselines[account.id].baselineAt });
+  } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+app.get("/api/scheduler/control", (req, res) => {
   const jobs = read(jobsFile);
-  const now = Date.now();
   const active = jobs.filter(j => ACTIVE_QUEUE_STATUSES.has(j.status));
-  const overdue = active.filter(j => new Date(j.scheduledAt).getTime() < now - LATE_JOB_GRACE_MS).length;
+  const now = Date.now();
   res.json({
     ok: true,
     paused: Boolean(schedulerControl.paused),
     pausedAt: schedulerControl.pausedAt || null,
     resumedAt: schedulerControl.resumedAt || null,
     activeJobs: active.length,
-    overdueJobs: overdue,
-    catchupProtection: true,
-    lateGraceSeconds: LATE_JOB_GRACE_MS / 1000,
-    catchupStartDelaySeconds: CATCHUP_START_DELAY_MS / 1000,
-    pattern: { burstSize: BURST_SIZE, gapMinutes: BURST_GAP_MINUTES, breakMinutes: BURST_BREAK_MINUTES }
+    overdueJobs: active.filter(j => new Date(j.scheduledAt).getTime() < now - LATE_JOB_GRACE_MS).length,
+    catchupProtection: true
   });
 });
 
 app.post("/api/scheduler/pause", async (req, res) => {
-  if (!schedulerControl.paused) {
-    schedulerControl.paused = true;
-    schedulerControl.pausedAt = new Date().toISOString();
-    await saveSchedulerControl();
-  }
+  schedulerControl.paused = true;
+  schedulerControl.pausedAt = new Date().toISOString();
+  await saveSchedulerControl();
+  await persistence?.flush?.();
   res.json({ ok: true, paused: true, pausedAt: schedulerControl.pausedAt });
 });
 
 app.post("/api/scheduler/resume", async (req, res) => {
-  const now = Date.now();
   const jobs = read(jobsFile);
-  let shifted = 0;
-  if (schedulerControl.paused && schedulerControl.pausedAt) {
-    const pauseStarted = new Date(schedulerControl.pausedAt).getTime();
-    const pauseDuration = Number.isFinite(pauseStarted) ? Math.max(0, now - pauseStarted) : 0;
-    if (pauseDuration > 0) {
-      for (const job of jobs) {
-        if (!ACTIVE_QUEUE_STATUSES.has(job.status)) continue;
-        const t = new Date(job.scheduledAt).getTime();
-        if (Number.isFinite(t)) {
-          job.scheduledAt = new Date(t + pauseDuration).toISOString();
-          if (job.nextAttemptAt) {
-            const n = new Date(job.nextAttemptAt).getTime();
-            if (Number.isFinite(n)) job.nextAttemptAt = new Date(n + pauseDuration).toISOString();
-          }
-          shifted++;
-        }
-      }
-    }
-  }
-  const rebased = rebaseLateBacklog(jobs, now, "manual_resume_catchup");
-  if (shifted || rebased) { await write(jobsFile, jobs); await persistence?.flush?.(); }
+  const now = Date.now();
+  const changed = rebaseLateBacklog(jobs, now, "manual_resume_catchup");
+  if (changed) await write(jobsFile, jobs);
   schedulerControl.paused = false;
-  schedulerControl.pausedAt = null;
   schedulerControl.resumedAt = new Date().toISOString();
   await saveSchedulerControl();
-  res.json({ ok: true, paused: false, shiftedJobs: shifted, rebasedJobs: rebased, resumedAt: schedulerControl.resumedAt });
+  await persistence?.flush?.();
+  res.json({ ok: true, paused: false, resumedAt: schedulerControl.resumedAt, rebasedJobs: changed });
 });
 
-app.get("/api/jobs", (req, res) => res.json(read(jobsFile)));
-
-// Lightweight dashboard payload for very large monthly queues. Older clients
-// can keep using /api/jobs; v11.8/v15 use this endpoint so 20k+ jobs are not
-// downloaded every few seconds.
-app.get("/api/dashboard-state", (req, res) => {
-  const jobs = read(jobsFile);
-  const activeStatuses = new Set(["scheduled","processing","ready","publishing","retry_wait"]);
-  const counts = {
-    active: jobs.filter(j => activeStatuses.has(j.status)).length,
-    published: jobs.filter(j => j.status === "published").length,
-    failed: jobs.filter(j => j.status === "failed").length,
-    total: jobs.length
-  };
-  const queue = jobs.filter(j => j.status !== "published")
-    .sort((a,b) => new Date(a.scheduledAt) - new Date(b.scheduledAt))
-    .slice(0, 600);
-  const published = jobs.filter(j => j.status === "published")
-    .sort((a,b) => new Date(b.publishedAt || b.scheduledAt || 0) - new Date(a.publishedAt || a.scheduledAt || 0))
-    .slice(0, 150);
-  res.json({ ok:true, counts, jobs:[...queue, ...published], queueReturned:queue.length, publishedReturned:published.length, truncated:jobs.length > queue.length + published.length });
-});
-
-
-function clientDayWindow(tzOffsetMinutes = 0, nowMs = Date.now()) {
-  const offset = Math.max(-14*60, Math.min(14*60, Number(tzOffsetMinutes || 0)));
-  const shifted = new Date(nowMs + offset * 60_000);
-  const y = shifted.getUTCFullYear(), m = shifted.getUTCMonth(), d = shifted.getUTCDate();
-  const start = Date.UTC(y, m, d) - offset * 60_000;
-  return { start, end: start + 86_400_000, offset };
-}
-function metricLatestNumber(insights, name) {
-  const metric = (insights?.data || []).find(x => x?.name === name);
-  const values = Array.isArray(metric?.values) ? metric.values : [];
-  for (let i = values.length - 1; i >= 0; i--) {
-    const n = Number(values[i]?.value);
-    if (Number.isFinite(n)) return { value: n, at: values[i]?.end_time || null, values };
-  }
-  const direct = Number(metric?.total_value?.value);
-  return Number.isFinite(direct) ? { value: direct, at: null, values: [] } : null;
-}
-function metricSeriesNumbers(insights, name) {
-  const metric = (insights?.data || []).find(x => x?.name === name);
-  return (Array.isArray(metric?.values) ? metric.values : [])
-    .map(v => ({ value: Number(v?.value), at: v?.end_time || null }))
-    .filter(v => Number.isFinite(v.value));
-}
-
-// Exact per-account published counts without making clients download the whole
-// monthly queue. Read-only/additive: this endpoint never edits scheduled jobs.
-app.get("/api/published-stats", (req, res) => {
-  const jobs = read(jobsFile);
-  const accounts = read(accountsFile);
-  const { start, end, offset } = clientDayWindow(req.query.tzOffsetMinutes);
-  const rows = accounts.map(account => {
-    const published = jobs.filter(j => j.accountId === account.id && j.status === "published");
-    const today = published.filter(j => {
-      const t = new Date(j.publishedAt || j.scheduledAt || 0).getTime();
-      return Number.isFinite(t) && t >= start && t < end;
-    });
-    const sorted = published.slice().sort((a,b)=>new Date(a.publishedAt||a.scheduledAt||0)-new Date(b.publishedAt||b.scheduledAt||0));
-    return {
-      accountId: account.id,
-      igUserId: account.igUserId,
-      label: account.label,
-      today: today.length,
-      total: published.length,
-      firstPublishedAt: sorted[0]?.publishedAt || sorted[0]?.scheduledAt || null,
-      lastPublishedAt: sorted.at(-1)?.publishedAt || sorted.at(-1)?.scheduledAt || null
-    };
-  });
-  res.json({ ok:true, tzOffsetMinutes: offset, accounts: rows, todayTotal: rows.reduce((n,r)=>n+r.today,0), totalPublished: rows.reduce((n,r)=>n+r.total,0) });
-});
-
-// Optional follower-growth analytics. This endpoint is isolated from the
-// scheduler and never edits scheduled jobs. v14.7 fixes the old baseline bug:
-// Instagram's follower_count insight series must not be treated as an absolute
-// historical follower total. Accurate growth tracking now uses an immutable,
-// durable follower snapshot captured from the profile's followers_count field.
-app.get("/api/account-analytics", async (req, res) => {
-  const accountId = String(req.query.accountId || "").trim();
-  const accounts = read(accountsFile);
-  const account = accounts.find(a => String(a.id) === accountId);
-  if (!account) return res.status(404).json({ error: "Account not found." });
-
-  const jobs = read(jobsFile);
-  const published = jobs.filter(j => j.accountId === account.id && j.status === "published");
-  const sorted = published.slice().sort((a,b)=>new Date(a.publishedAt||a.scheduledAt||0)-new Date(b.publishedAt||b.scheduledAt||0));
-  const firstPublishedAt = sorted[0]?.publishedAt || sorted[0]?.scheduledAt || null;
-  const { start: todayStart, end: todayEnd } = clientDayWindow(req.query.tzOffsetMinutes);
-  const todayPublished = published.filter(j => {
-    const t = new Date(j.publishedAt || j.scheduledAt || 0).getTime();
-    return Number.isFinite(t) && t >= todayStart && t < todayEnd;
-  }).length;
-
-  const token = decrypt(account.tokenEnc);
-  let profile = null, profileError = null;
+app.post("/api/media/presign", async (req, res) => {
   try {
-    profile = await graph(`${account.igUserId}`, { fields: "username,followers_count,follows_count,media_count" }, token, "GET");
-  } catch (e) { profileError = e; }
+    const { videoName, mimeType, size } = req.body || {};
+    if (!videoName) return res.status(400).json({ error: "videoName is required." });
+    if (typeof mediaStore?.createBrowserUpload !== "function") return res.status(409).json({ error: "Direct browser upload is unavailable for the configured media store." });
+    const uploadInfo = await mediaStore.createBrowserUpload({ videoName:String(videoName), mimeType:String(mimeType||"video/mp4"), size:Number(size||0) });
+    res.json({ ok:true, ...uploadInfo });
+  } catch (e) { res.status(400).json({ error:e.message }); }
+});
 
-  // Reach/profile views remain historical Meta Insights metrics. follower_count
-  // is intentionally NOT used for the baseline because its day-series values
-  // are not a reliable absolute follower snapshot for this purpose.
-  let insights = null, insightsError = null;
-  const now = Date.now();
-  const earliestAllowed = now - 89 * 86_400_000;
-  const firstMs = firstPublishedAt ? new Date(firstPublishedAt).getTime() : now;
-  const sinceMs = Math.max(Number.isFinite(firstMs) ? firstMs : now, earliestAllowed);
+app.post("/api/jobs/from-media", async (req, res) => {
   try {
-    insights = await graph(`${account.igUserId}/insights`, {
-      metric: "reach,profile_views",
-      period: "day",
-      since: Math.floor(sinceMs / 1000),
-      until: Math.floor(now / 1000)
-    }, token, "GET");
-  } catch (e) { insightsError = e; }
-
-  const reachLatest = metricLatestNumber(insights, "reach");
-  const profileViewsLatest = metricLatestNumber(insights, "profile_views");
-  let currentFollowers = Number(profile?.followers_count);
-  if (!Number.isFinite(currentFollowers)) currentFollowers = null;
-
-  // v2 baseline namespace deliberately ignores the old v14.6 baseline logic.
-  // A baseline is written exactly once per connected account and survives
-  // Render restarts/redeploys through the existing durable Postgres layer.
-  let baselines = {};
-  try { baselines = (await persistence?.get?.("analytics_baselines_v2")) || {}; } catch (_) {}
-  if (!baselines || typeof baselines !== "object" || Array.isArray(baselines)) baselines = {};
-
-  let baselineFollowers = null, baselineAt = null, baselineSource = null;
-  const saved = baselines[account.id];
-  if (saved && Number.isFinite(Number(saved.followers)) && Number(saved.followers) > 0) {
-    baselineFollowers = Number(saved.followers);
-    baselineAt = saved.at || null;
-    baselineSource = "durable_tracking_baseline_v2";
-  } else if (Number.isFinite(currentFollowers)) {
-    baselineFollowers = currentFollowers;
-    baselineAt = new Date().toISOString();
-    baselineSource = "tracking_started_v14_7";
-    baselines[account.id] = {
-      followers: currentFollowers,
-      at: baselineAt,
-      igUserId: account.igUserId,
-      label: account.label || null,
-      firstPublishedAt: firstPublishedAt || null
-    };
-    try { await persistence?.set?.("analytics_baselines_v2", baselines); } catch (_) {}
-  }
-
-  // Keep lightweight durable samples so the dashboard can show change since
-  // the previous successful analytics check without affecting the scheduler.
-  let samples = {};
-  try { samples = (await persistence?.get?.("analytics_follower_samples_v2")) || {}; } catch (_) {}
-  if (!samples || typeof samples !== "object" || Array.isArray(samples)) samples = {};
-  const accountSamples = Array.isArray(samples[account.id]) ? samples[account.id] : [];
-  const previousSample = accountSamples.length ? accountSamples[accountSamples.length - 1] : null;
-  let followersChangeSinceLastCheck = null;
-  if (Number.isFinite(currentFollowers) && previousSample && Number.isFinite(Number(previousSample.followers))) {
-    followersChangeSinceLastCheck = currentFollowers - Number(previousSample.followers);
-  }
-  if (Number.isFinite(currentFollowers)) {
-    const last = accountSamples[accountSamples.length - 1];
-    // Avoid writing duplicate samples for repeated refreshes within 15 minutes
-    // when the follower count is unchanged.
-    const shouldAppend = !last || Number(last.followers) !== currentFollowers || (now - new Date(last.at || 0).getTime()) >= 15 * 60_000;
-    if (shouldAppend) {
-      accountSamples.push({ followers: currentFollowers, at: new Date().toISOString() });
-      samples[account.id] = accountSamples.slice(-500);
-      try { await persistence?.set?.("analytics_follower_samples_v2", samples); } catch (_) {}
+    if (REQUIRE_RESTART_SAFE_STORAGE) {
+      const media = mediaStore.describe();
+      const statePersistent = Boolean(persistence?.durable || persistentRoot);
+      const mediaPersistent = Boolean(media.persistent || persistentRoot);
+      if (!(statePersistent && mediaPersistent)) return res.status(409).json({ error:"Restart-safe storage is not configured. Refusing new schedules until both state and media are persistent.", storage:{statePersistent,mediaPersistent,media:media.type} });
     }
-  }
-
-  const followersGain = Number.isFinite(currentFollowers) && Number.isFinite(baselineFollowers)
-    ? currentFollowers - baselineFollowers
-    : null;
-  const permissionNeeded = Boolean(insightsError) && /permission|insight|scope|access/i.test(String(insightsError.message || insightsError));
-
-  let note = "";
-  if (baselineSource === "tracking_started_v14_7") {
-    note = "Accurate follower tracking starts from this snapshot because an absolute follower baseline was not stored before v14.7.";
-  } else if (baselineSource === "durable_tracking_baseline_v2") {
-    note = `Follower gain is tracked from the durable baseline saved at ${baselineAt || "the first v14.7 analytics check"}.`;
-  }
-  if (permissionNeeded) note += `${note ? " " : ""}For reach/profile insights, add instagram_business_manage_insights and reconnect/regenerate the Instagram token.`;
-  if (!currentFollowers && profileError) note += `${note ? " " : ""}${profileError.message}`;
-
-  res.json({
-    ok: true,
-    accountId: account.id,
-    label: account.label,
-    firstPublishedAt,
-    todayPublished,
-    totalPublished: published.length,
-    currentFollowers,
-    baselineFollowers,
-    baselineAt,
-    baselineSource,
-    followersGain,
-    followersChangeSinceLastCheck,
-    currentMediaCount: Number.isFinite(Number(profile?.media_count)) ? Number(profile.media_count) : null,
-    reachToday: reachLatest?.value ?? null,
-    profileViewsToday: profileViewsLatest?.value ?? null,
-    insightsPermissionNeeded: permissionNeeded,
-    insightsError: insightsError ? String(insightsError.message || insightsError) : null,
-    note
-  });
-});
-
-// Read-only baseline inspection endpoint for debugging/dashboard use.
-app.get("/api/analytics-baselines", async (req, res) => {
-  let baselines = {};
-  try { baselines = (await persistence?.get?.("analytics_baselines_v2")) || {}; } catch (_) {}
-  res.json({ ok: true, baselines });
-});
-
-// Summaries for long-running Monthly Smart 24H plans. The actual schedule is
-// still stored on each job, so the plan survives restarts with the same durable
-// Postgres persistence as the rest of the queue.
-app.get("/api/monthly-plans", (req, res) => {
-  const jobs = read(jobsFile).filter(j => j.planId && j.scheduleKind === "monthly_smart");
-  const groups = new Map();
-  for (const job of jobs) {
-    if (!groups.has(job.planId)) groups.set(job.planId, {
-      planId: job.planId,
-      startDate: job.planStartDate || null,
-      endDate: job.planEndDate || null,
-      dailyLimit: Number(job.planDailyLimit || 0),
-      accountCount: 0,
-      accounts: new Set(),
-      jobs: 0,
-      scheduled: 0,
-      published: 0,
-      failed: 0,
-      firstScheduledAt: null,
-      lastScheduledAt: null,
-      createdAt: job.createdAt || null
-    });
-    const g = groups.get(job.planId);
-    g.jobs++;
-    g.accounts.add(job.accountId);
-    if (job.status === "published") g.published++;
-    else if (job.status === "failed") g.failed++;
-    else if (["scheduled","processing","ready","publishing","retry_wait"].includes(job.status)) g.scheduled++;
-    const t = new Date(job.scheduledAt).getTime();
-    if (Number.isFinite(t)) {
-      if (!g.firstScheduledAt || t < new Date(g.firstScheduledAt).getTime()) g.firstScheduledAt = job.scheduledAt;
-      if (!g.lastScheduledAt || t > new Date(g.lastScheduledAt).getTime()) g.lastScheduledAt = job.scheduledAt;
+    const { mediaRef, accountIds, caption, schedule, videoName, sourceUploadId, clientBatchId } = req.body || {};
+    if (!mediaRef?.storageKey) return res.status(400).json({ error:"mediaRef.storageKey is required." });
+    if (!Array.isArray(accountIds) || !accountIds.length) return res.status(400).json({ error:"Select at least one account." });
+    if (accountIds.length > 15) return res.status(400).json({ error:"Maximum 15 accounts." });
+    const accounts = read(accountsFile);
+    const selected = accountIds.map(id=>accounts.find(a=>a.id===id)).filter(Boolean);
+    if (selected.length !== accountIds.length) return res.status(400).json({ error:"One or more account IDs are invalid." });
+    const jobs = read(jobsFile);
+    const sid = String(sourceUploadId || "").trim();
+    if (sid) {
+      const already = jobs.filter(j => j.sourceUploadId === sid);
+      if (already.length) return res.json({ ok:true, duplicate:true, created:0, jobs:already.map(jobPublic) });
     }
-  }
-  const out = [...groups.values()].map(g => ({...g, accountCount: g.accounts.size, accounts: undefined})).sort((a,b)=>new Date(b.createdAt||0)-new Date(a.createdAt||0));
-  res.json({ ok: true, plans: out });
+    const mode = schedule?.mode || "fixed";
+    const count = selected.length;
+    let times=[];
+    if (mode === "fixed") {
+      const fixed = new Date(schedule?.fixedAt).getTime();
+      if (!Number.isFinite(fixed)) throw new Error("Invalid fixed time.");
+      const stagger = Math.max(0, Number(schedule?.staggerMinutes || 0))*60_000;
+      times = selected.map((_,i)=>fixed+i*stagger);
+    } else {
+      const start = new Date(schedule?.startAt).getTime();
+      const end = new Date(schedule?.endAt).getTime();
+      times = generateTimes(count,start,end,Number(schedule?.gapMinutes || 5));
+    }
+    const created=[];
+    for (let i=0;i<selected.length;i++) {
+      const a=selected[i];
+      const job={
+        id:newId(), accountId:a.id, accountLabel:a.label, videoName:String(videoName || mediaRef.videoName || mediaRef.storageKey), caption:String(caption||""),
+        mediaUrl:mediaRef.mediaUrl || null, storageKey:mediaRef.storageKey, storageType:mediaRef.storageType || mediaStore.describe().type,
+        scheduledAt:new Date(times[i]).toISOString(), status:"scheduled", createdAt:new Date().toISOString(), retryCount:0, nextAttemptAt:null, lastErrorType:null,
+        sourceUploadId:sid||null, batchId:String(clientBatchId||"").trim()||null, scheduleMode:mode
+      };
+      jobs.push(job); created.push(jobPublic(job));
+    }
+    await write(jobsFile,jobs); await persistence?.flush?.();
+    res.json({ ok:true, created:created.length, jobs:created });
+  } catch(e) { res.status(400).json({ error:e.message }); }
 });
 
-// Manually remove a queued job. We intentionally block jobs that are actively
-// processing/publishing or already published so a user cannot interrupt a Meta
-// API transaction halfway through.
+app.post("/api/jobs", upload.single("video"), async (req, res) => {
+  let stored = null;
+  try {
+    if (!req.file) return res.status(400).json({ error: "Video is required." });
+    if (REQUIRE_RESTART_SAFE_STORAGE) {
+      const media = mediaStore.describe();
+      const statePersistent = Boolean(persistence?.durable || persistentRoot);
+      const mediaPersistent = Boolean(media.persistent || persistentRoot);
+      if (!(statePersistent && mediaPersistent)) throw new Error("Restart-safe storage is not configured. Refusing new schedules until both state and media are persistent.");
+    }
+    const accountIds = JSON.parse(req.body.accountIds || "[]");
+    const schedule = JSON.parse(req.body.schedule || "{}");
+    if (!Array.isArray(accountIds) || !accountIds.length) throw new Error("Select at least one account.");
+    if (accountIds.length > 15) throw new Error("Maximum 15 accounts.");
+    const accounts = read(accountsFile);
+    const selected = accountIds.map(id => accounts.find(a => a.id === id)).filter(Boolean);
+    if (selected.length !== accountIds.length) throw new Error("One or more account IDs are invalid.");
+    stored = await mediaStore.store(req.file);
+    const jobs = read(jobsFile);
+    const sourceUploadId = String(req.body.sourceUploadId || "").trim();
+    if (sourceUploadId) {
+      const already = jobs.filter(j => j.sourceUploadId === sourceUploadId);
+      if (already.length) {
+        await mediaStore.remove(stored).catch(()=>{});
+        stored = null;
+        return res.json({ ok:true, duplicate:true, created:0, jobs:already.map(jobPublic) });
+      }
+    }
+    const mode = schedule.mode || "fixed";
+    const count = selected.length;
+    let times = [];
+    if (mode === "fixed") {
+      const fixed = new Date(schedule.fixedAt).getTime();
+      if (!Number.isFinite(fixed)) throw new Error("Invalid fixed time.");
+      const stagger = Math.max(0, Number(schedule.staggerMinutes || 0)) * 60_000;
+      times = selected.map((_, i) => fixed + i * stagger);
+    } else {
+      const start = new Date(schedule.startAt).getTime();
+      const end = new Date(schedule.endAt).getTime();
+      times = generateTimes(count, start, end, Number(schedule.gapMinutes || 5));
+    }
+    const created = [];
+    for (let i = 0; i < selected.length; i++) {
+      const a = selected[i];
+      const job = { id:newId(), accountId:a.id, accountLabel:a.label, videoName:req.file.originalname, caption:String(req.body.caption || ""), mediaUrl:stored.mediaUrl, storageKey:stored.storageKey, storageType:stored.storageType, scheduledAt:new Date(times[i]).toISOString(), status:"scheduled", createdAt:new Date().toISOString(), retryCount:0, nextAttemptAt:null, lastErrorType:null, sourceUploadId:sourceUploadId||null, batchId:String(req.body.clientBatchId||"").trim()||null, scheduleMode:mode };
+      jobs.push(job); created.push(jobPublic(job));
+    }
+    await write(jobsFile, jobs);
+    await persistence?.flush?.();
+    res.json({ ok: true, created: created.length, jobs: created });
+  } catch (e) {
+    if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
+    if (stored) await mediaStore.remove(stored).catch(()=>{});
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post("/api/jobs/monthly", upload.single("video"), async (req, res) => {
+  let stored = null;
+  try {
+    if (!req.file) return res.status(400).json({ error:"Video is required." });
+    if (REQUIRE_RESTART_SAFE_STORAGE) {
+      const media=mediaStore.describe(); const statePersistent=Boolean(persistence?.durable||persistentRoot); const mediaPersistent=Boolean(media.persistent||persistentRoot);
+      if (!(statePersistent&&mediaPersistent)) throw new Error("Restart-safe storage is not configured. Refusing new schedules until both state and media are persistent.");
+    }
+    const accountIds=JSON.parse(req.body.accountIds||"[]");
+    const schedule=JSON.parse(req.body.schedule||"{}");
+    const clientBatchId=String(req.body.clientBatchId||"").trim();
+    const sourceUploadId=String(req.body.sourceUploadId||"").trim();
+    if(!Array.isArray(accountIds)||!accountIds.length) throw new Error("Select at least one account.");
+    if(accountIds.length>15) throw new Error("Maximum 15 accounts.");
+    if(!clientBatchId) throw new Error("clientBatchId is required for monthly schedules.");
+    const startDate=String(schedule.startDate||""); const endDate=String(schedule.endDate||"");
+    const startMs=Date.parse(startDate+"T00:00:00Z"); const endMs=Date.parse(endDate+"T00:00:00Z");
+    if(!Number.isFinite(startMs)||!Number.isFinite(endMs)||endMs<startMs) throw new Error("Invalid monthly start/end date.");
+    const dayIndex=Math.max(0,Math.trunc(Number(schedule.dayIndex||0)));
+    const dailyLimit=Math.max(1,Math.min(60,Math.trunc(Number(schedule.dailyLimit||50))));
+    if(dayIndex>=dailyLimit) throw new Error("Monthly dayIndex exceeds the daily limit.");
+    const dayCount=Math.floor((endMs-startMs)/86400000)+1;
+    if(dayCount>62) throw new Error("Maximum monthly range is 62 days.");
+    const accounts=read(accountsFile); const selected=accountIds.map(id=>accounts.find(a=>a.id===id)).filter(Boolean);
+    if(selected.length!==accountIds.length) throw new Error("One or more account IDs are invalid.");
+    const jobs=read(jobsFile);
+    if(sourceUploadId){const already=jobs.filter(j=>j.sourceUploadId===sourceUploadId); if(already.length){return res.json({ok:true,duplicate:true,created:0,jobs:already.map(jobPublic)});}}
+    stored=await mediaStore.store(req.file);
+    const created=[];
+    for(let d=0;d<dayCount;d++){
+      const dayStart=startMs+d*86400000;
+      for(let ai=0;ai<selected.length;ai++){
+        const a=selected[ai];
+        const accountOffsetMs=Math.floor((ai*86400000)/Math.max(1,selected.length));
+        const slotMs=Math.floor((dayIndex*86400000)/dailyLimit);
+        const jitterSpan=Math.max(60_000,Math.floor(86400000/dailyLimit*0.35));
+        const deterministicSeed=crypto.createHash("sha256").update(clientBatchId+"|"+a.id+"|"+d+"|"+dayIndex).digest().readUInt32BE(0)/0xffffffff;
+        const jitter=Math.floor((deterministicSeed-0.5)*jitterSpan);
+        let scheduledAt=dayStart+((slotMs+accountOffsetMs+jitter)%86400000+86400000)%86400000;
+        const job={id:newId(),accountId:a.id,accountLabel:a.label,videoName:req.file.originalname,caption:String(req.body.caption||""),mediaUrl:stored.mediaUrl,storageKey:stored.storageKey,storageType:stored.storageType,scheduledAt:new Date(scheduledAt).toISOString(),status:"scheduled",createdAt:new Date().toISOString(),retryCount:0,nextAttemptAt:null,lastErrorType:null,sourceUploadId:sourceUploadId||null,batchId:clientBatchId,scheduleMode:"monthly24",monthlyDay:new Date(dayStart).toISOString().slice(0,10),monthlyDayIndex:dayIndex,dailyLimit};
+        jobs.push(job); created.push(jobPublic(job));
+      }
+    }
+    await write(jobsFile,jobs); await persistence?.flush?.();
+    res.json({ok:true,created:created.length,dayCount,dailyLimit,jobs:created});
+  } catch(e){ if(req.file?.path){try{fs.unlinkSync(req.file.path);}catch(_){}} if(stored)await mediaStore.remove(stored).catch(()=>{}); res.status(400).json({error:e.message}); }
+});
+
 app.delete("/api/jobs/:id", async (req, res) => {
   const jobs = read(jobsFile);
-  const index = jobs.findIndex((j) => j.id === req.params.id);
-  if (index < 0) return res.status(404).json({ error: "Job not found." });
-  const job = jobs[index];
-  if (["processing", "publishing", "published"].includes(job.status)) {
-    return res.status(409).json({ error: `Cannot delete a ${job.status} job.` });
-  }
-  const [removed] = jobs.splice(index, 1);
+  const idx = jobs.findIndex(j => j.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ error: "Job not found." });
+  const job = jobs[idx];
+  if (job.status === "publishing") return res.status(409).json({ error: "This job is currently publishing." });
+  jobs.splice(idx, 1);
   await write(jobsFile, jobs);
   await persistence?.flush?.();
-
-  // Remove media only when no other job references the same object.
-  if (removed.mediaUrl && !jobs.some((j) => j.mediaUrl === removed.mediaUrl)) {
-    mediaStore.remove(removed).catch(() => {});
-  }
-  res.json({ ok: true, deleted: removed.id });
+  res.json({ ok: true });
 });
 
-// Ignore the original schedule for one job and move it to the front of the
-// normal smart-rate-limit queue. It still respects Meta throttling/backoff.
 app.post("/api/jobs/:id/post-now", async (req, res) => {
   const jobs = read(jobsFile);
-  const job = jobs.find((j) => j.id === req.params.id);
+  const job = jobs.find(j => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found." });
-  if (["processing", "publishing", "published"].includes(job.status)) {
-    return res.status(409).json({ error: `Cannot Post Now while job is ${job.status}.` });
-  }
+  if (job.status === "published") return res.status(409).json({ error: "Already published." });
+  if (job.status === "publishing") return res.status(409).json({ error: "Publishing already in progress." });
   job.scheduledAt = new Date().toISOString();
-  job.nextAttemptAt = null;
-  job.error = null;
-  job.lastErrorType = null;
-  // If a container already exists and was ready, publish on the next scheduler
-  // pass; otherwise resume preparation/checking without creating duplicates.
-  if (job.status === "ready") {
-    job.status = "ready";
-  } else if (job.containerId) {
-    job.status = "processing";
-  } else {
-    job.status = "scheduled";
+  if (job.status === "failed" || job.status === "retry_wait") {
+    job.status = job.containerId ? "processing" : "scheduled";
+    job.error = null;
+    job.lastErrorType = null;
   }
+  job.nextAttemptAt = null;
   await write(jobsFile, jobs);
   await persistence?.flush?.();
   res.json({ ok: true, id: job.id, status: job.status, scheduledAt: job.scheduledAt });
 });
 
-app.post("/api/schedule", requireSafeStorage, upload.array("videos", 10), async (req, res) => {
-  try {
-    const files = req.files || [];
-    if (!files.length) throw new Error("At least one video is required.");
-    const cfg = JSON.parse(req.body.config || "{}");
-    const accounts = read(accountsFile);
-    const selected = (cfg.accountIds || []).map((accountId) => accounts.find((a) => a.id === accountId)).filter(Boolean);
-    if (!selected.length) throw new Error("No valid accounts selected.");
-    if (selected.length > 15) throw new Error("Maximum 15 accounts per batch.");
-    if (files.length > 10) throw new Error("Maximum 10 videos per upload chunk.");
-
-    const totalJobs = files.length * selected.length;
-    if (totalJobs > 150) throw new Error("Maximum 150 generated posts per upload chunk.");
-
-    const now = Date.now();
-    let scheduleTimes = [];
-    if (cfg.mode === "explicit") {
-      if (!Array.isArray(cfg.explicitTimes) || cfg.explicitTimes.length !== totalJobs) throw new Error("Explicit schedule count does not match generated jobs.");
-      scheduleTimes = cfg.explicitTimes.map((v) => { const t = new Date(v).getTime(); if (!Number.isFinite(t)) throw new Error("Invalid explicit schedule time."); return t; });
-    } else if (cfg.mode === "random") {
-      let start = new Date(cfg.startAt).getTime();
-      const end = new Date(cfg.endAt).getTime();
-      if (!Number.isFinite(start) || !Number.isFinite(end)) throw new Error("Invalid random time window.");
-      start = Math.max(start, now);
-      if (end <= now) throw new Error("Random window has already ended.");
-      scheduleTimes = generateTimes(totalJobs, start, end, Number(cfg.minGapMinutes || 0));
-    } else {
-      let fixed = new Date(cfg.fixedAt).getTime();
-      if (!Number.isFinite(fixed)) throw new Error("Invalid fixed time.");
-      // datetime-local has minute precision. If the chosen current minute is already a few seconds old,
-      // treat it as NOW instead of shifting it into the future or rejecting it.
-      if (fixed < now - 90_000) throw new Error("Fixed time is too far in the past.");
-      if (fixed <= now + 5_000) fixed = now;
-      const gap = Math.max(0, Number(cfg.minGapMinutes || 0)) * 60_000;
-      scheduleTimes = Array.from({ length: totalJobs }, (_, i) => fixed + i * gap);
-    }
-
-    // Idempotency for resumable/background uploads: if a client retries a chunk
-    // after the backend already created every matching job, do not duplicate it.
-    const jobs = read(jobsFile);
-    const scheduleIso = scheduleTimes.map(t => new Date(t).toISOString());
-    const existingKeys = new Set(jobs.filter(j => j.batchId === (cfg.batchId || "")).map(j => `${j.accountId}|${j.fileName}|${j.scheduledAt}`));
-    if (cfg.batchId) {
-      const expected = [];
-      let ei = 0;
-      for (const file of files) for (const account of selected) expected.push(`${account.id}|${file.originalname}|${scheduleIso[ei++]}`);
-      if (expected.length && expected.every(k => existingKeys.has(k))) {
-        for (const file of files) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
-        return res.json({ ok:true, created:0, deduped:expected.length, videos:files.length, accounts:selected.length, firstScheduledAt:scheduleIso[0], lastScheduledAt:scheduleIso[scheduleIso.length-1] });
-      }
-    }
-
-    const base = publicBaseUrl(req);
-    const storedFiles = [];
-    for (const file of files) {
-      const stored = await mediaStore.put(file, file.originalname, base);
-      storedFiles.push({ originalname: file.originalname, mediaUrl: stored.mediaUrl, storageKey: stored.storageKey || null });
-    }
-
-    const batchId = cfg.batchId || newId();
-    let index = 0, createdCount = 0;
-    const perVideoCaptions = Array.isArray(cfg.captions) ? cfg.captions.map((v) => String(v ?? "").slice(0, 2200)) : [];
-    let fileIndex = 0;
-    // Every selected video is scheduled to every selected account.
-    for (const file of storedFiles) {
-      const fileCaption = (perVideoCaptions[fileIndex] !== undefined ? perVideoCaptions[fileIndex] : String(cfg.caption || "")).slice(0, 2200);
-      for (const account of selected) {
-        const scheduledAt = scheduleIso[index++];
-        const dedupeKey = `${account.id}|${file.originalname}|${scheduledAt}`;
-        if (cfg.batchId && existingKeys.has(dedupeKey)) continue;
-        jobs.push({
-          id: newId(),
-          batchId,
-          accountId: account.id,
-          accountLabel: account.label,
-          igUserId: account.igUserId,
-          fileName: file.originalname,
-          mediaUrl: file.mediaUrl,
-          storageKey: file.storageKey || null,
-          caption: fileCaption,
-          scheduledAt,
-          status: "scheduled",
-          createdAt: new Date().toISOString(),
-          error: null,
-          containerId: null,
-          preparedAt: null,
-          publishedMediaId: null,
-          permalink: null,
-          permalinkFetchedAt: null,
-          retryCount: 0,
-          nextAttemptAt: null,
-          lastAttemptAt: null,
-          lastErrorType: null,
-          scheduleKind: String(cfg.scheduleKind || "standard"),
-          planId: cfg.planId ? String(cfg.planId) : null,
-          planStartDate: cfg.monthlyPlan?.startDate ? String(cfg.monthlyPlan.startDate) : null,
-          planEndDate: cfg.monthlyPlan?.endDate ? String(cfg.monthlyPlan.endDate) : null,
-          planDailyLimit: cfg.monthlyPlan?.dailyLimit ? Number(cfg.monthlyPlan.dailyLimit) : null
-        });
-        createdCount++;
-      }
-      fileIndex++;
-    }
-
-    await write(jobsFile, jobs);
-    await persistence?.flush?.();
-    res.json({ ok: true, created: createdCount, deduped: totalJobs-createdCount, videos: files.length, accounts: selected.length, firstScheduledAt: scheduleIso[0], lastScheduledAt: scheduleIso[scheduleIso.length - 1] });
-  } catch (error) {
-    for (const file of req.files || []) if (file?.path && fs.existsSync(file.path)) fs.unlinkSync(file.path);
-    res.status(400).json({ error: error.message });
-  }
-});
-
 function isRateLimitError(message) {
-  return /request limit|rate limit|too many|temporarily blocked|try again later|throttl/i.test(String(message || ""));
+  const m = String(message || "").toLowerCase();
+  return m.includes("application request limit reached") || m.includes("too many calls") || m.includes("rate limit") || m.includes("code 4") || m.includes("code 17") || m.includes("code 32");
 }
 
-function retryDelayMs(retryCount, rateLimited = false) {
-  if (rateLimited) return Math.min(6 * 60 * 60_000, RATE_LIMIT_BACKOFF_MS * Math.max(1, Math.pow(2, Math.min(retryCount - 1, 3))));
+function retryDelayMs(retryCount, rateLimited) {
+  if (rateLimited) return RATE_LIMIT_BACKOFF_MS;
   return Math.min(60 * 60_000, 2 * 60_000 * Math.max(1, Math.pow(2, Math.min(retryCount - 1, 5))));
 }
 
@@ -920,7 +801,8 @@ async function graph(pathname, params, token, method = "POST") {
 
 async function createContainer(job, account) {
   const token = decrypt(account.tokenEnc);
-  const created = await graph(`${account.igUserId}/media`, { media_type: "REELS", video_url: job.mediaUrl, caption: job.caption, share_to_feed: "true" }, token);
+  const videoUrl = typeof mediaStore?.metaUrl === "function" ? await mediaStore.metaUrl(job) : job.mediaUrl;
+  const created = await graph(`${account.igUserId}/media`, { media_type: "REELS", video_url: videoUrl, caption: job.caption, share_to_feed: "true" }, token);
   return created.id;
 }
 
@@ -978,13 +860,9 @@ async function runSchedulerUnlocked() {
     const jobs = read(jobsFile);
     let changed = false;
 
-    // Render Free can sleep. If the service wakes with old overdue jobs, never
-    // dump the backlog immediately. Rebuild each affected account timeline from
-    // now using the configured 5x10-minute + 1-hour-break burst pattern.
     const rebasedLate = rebaseLateBacklog(jobs, now, "automatic_wake_catchup");
     if (rebasedLate) changed = true;
 
-    // Wake retry jobs only when their backoff has elapsed.
     for (const job of jobs) {
       if (job.status === "retry_wait" && eligibleAt(job, now)) {
         job.status = job.containerId ? "processing" : "scheduled";
@@ -993,8 +871,6 @@ async function runSchedulerUnlocked() {
       }
     }
 
-    // Do at most ONE Meta API action per scheduler pass. This deliberately
-    // trades speed for compliance and prevents bursts when hundreds of jobs exist.
     const ordered = jobs
       .filter(j => !["failed", "retry_wait"].includes(j.status) && eligibleAt(j, now) && (j.status !== "published" || (j.publishedMediaId && !j.permalink)))
       .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
@@ -1032,11 +908,9 @@ async function runSchedulerUnlocked() {
             job.error = null;
             job.lastErrorType = null;
           } else if (state.status_code === "ERROR" || state.status_code === "EXPIRED") {
-            // A broken/expired container can be recreated on a later attempt.
             job.containerId = null;
             throw new Error(`Instagram container status: ${state.status_code}`);
           } else {
-            // Poll slowly; do not hammer container status endpoints.
             job.nextAttemptAt = new Date(Date.now() + 30_000).toISOString();
           }
         } else if (action === "publish") {
@@ -1082,7 +956,6 @@ async function cleanupPublishedMedia() {
   for (const job of jobs) {
     if (job.status !== "published" || !job.publishedAt || !job.storageKey || job.mediaDeletedAt) continue;
     if (new Date(job.publishedAt).getTime() > cutoff) continue;
-    // Only remove an object when all jobs referencing it are already published.
     const siblings = jobs.filter(j => j.mediaUrl === job.mediaUrl);
     if (!siblings.every(j => j.status === "published")) continue;
     try {
@@ -1112,4 +985,4 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.7 analytics-baseline-fix backend running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Insta Auto Publisher v14.8 direct-drive-bandwidth-saver backend running on port ${PORT}`));
