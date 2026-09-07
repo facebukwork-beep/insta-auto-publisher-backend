@@ -14,12 +14,10 @@ export default {
     }catch(e){return Response.json({ok:false,error:String(e?.message||e)},{status:500,headers:{'access-control-allow-origin':'*','cache-control':'no-store'}})}
   },
   async scheduled(controller,env,ctx){
+    // Global action-limit state is now monitor-only. Per-account v15.6 cooldown
+    // protection still runs, but unaffected accounts are allowed to continue.
     ctx.waitUntil((async()=>{
-      const ctl=await detectAndUpdateGlobalCooldown(env).catch(e=>{console.error('global-action-cooldown',e?.stack||e);return null});
-      if(ctl?.active){
-        console.log('Meta global cooldown active until',ctl.until);
-        return;
-      }
+      await detectAndUpdateGlobalCooldown(env).catch(e=>console.error('global-action-monitor',e?.stack||e));
       priorWorker.scheduled(controller,env,ctx);
     })());
   }
@@ -47,22 +45,22 @@ async function detectAndUpdateGlobalCooldown(env){
   }
 
   const until=new Date(ctl.until||0).getTime();
-  if(Number.isFinite(until)&&until>now) return {...ctl,active:true,remainingMinutes:Math.ceil((until-now)/60000)};
+  if(Number.isFinite(until)&&until>now) return {...ctl,active:true,monitorOnly:true,remainingMinutes:Math.ceil((until-now)/60000)};
 
   if(ctl.until&&until<=now&&Number(ctl.strikes||0)>0){
     ctl={...ctl,until:null,updatedAt:new Date(now).toISOString(),strikes:Math.max(0,Number(ctl.strikes||0)-1)};
     await stateSet(env,GLOBAL_KEY,ctl);
   }
-  return {...ctl,active:false,remainingMinutes:0};
+  return {...ctl,active:false,monitorOnly:true,remainingMinutes:0};
 }
 
 async function throttleStatus(env){
   const ctl=await detectAndUpdateGlobalCooldown(env);
-  return Response.json({ok:true,...ctl},{headers:{'access-control-allow-origin':'*','cache-control':'no-store'}});
+  return Response.json({ok:true,...ctl,blockingScheduler:false},{headers:{'access-control-allow-origin':'*','cache-control':'no-store'}});
 }
 
 async function health157(request,env,ctx){
   const r=await priorWorker.fetch(request,env,ctx);const x=await r.clone().json().catch(()=>null);if(!x)return r;
   const ctl=await detectAndUpdateGlobalCooldown(env).catch(()=>null);
-  return Response.json({...x,version:'15.7.0',metaThrottle:ctl?{active:!!ctl.active,until:ctl.until||null,remainingMinutes:ctl.remainingMinutes||0,accounts:ctl.accounts||[]}:null,features:{...(x.features||{}),adaptiveGlobalMetaCooldown:true,multiAccountActionLimitProtection:true}},{headers:{'access-control-allow-origin':'*','cache-control':'no-store'}});
+  return Response.json({...x,version:'15.7.1',metaThrottle:ctl?{active:!!ctl.active,monitorOnly:true,blockingScheduler:false,until:ctl.until||null,remainingMinutes:ctl.remainingMinutes||0,accounts:ctl.accounts||[]}:null,features:{...(x.features||{}),adaptiveGlobalMetaCooldown:true,multiAccountActionLimitProtection:true,unaffectedAccountsContinue:true}},{headers:{'access-control-allow-origin':'*','cache-control':'no-store'}});
 }
