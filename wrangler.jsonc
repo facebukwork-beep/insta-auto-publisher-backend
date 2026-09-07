@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "insta-auto-publisher-backend",
-  "main": "src/worker-v154.js",
+  "main": "src/worker-v155.js",
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
   "triggers": {
